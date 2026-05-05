@@ -1,14 +1,13 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from supabase import create_client
-import re, os
+import re
 
 app = FastAPI()
 
-# ── Connexion Supabase via variables d'environnement ─────────────────────────
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
+# ── Connexion Supabase ────────────────────────────────────────────────────────
+SUPABASE_URL = "https://cjwbryhwfofpoopcbmpn.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqd2JyeWh3Zm9mcG9vcGNibXBuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNjYwNjMsImV4cCI6MjA5MTk0MjA2M30.rCjCQdFfHzbKf12XAIrwbOTkVCPcdEqOXD7WiBno4Uk"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Modèle SMS ────────────────────────────────────────────────────────────────
