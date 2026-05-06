@@ -132,30 +132,23 @@ def parser_sms(message: str, sender: str) -> dict:
 
 def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_avant: int, solde_apres: int):
-    """
-    Règle absolue basée sur le solde SIM :
-    - Solde SIM diminue → agent a reçu du cash → cash AUGMENTE
-    - Solde SIM augmente → agent a donné du cash → cash DIMINUE
-    """
     from datetime import datetime, timezone, timedelta
-    paris = timezone(timedelta(hours=2))
-    aujourd_hui = datetime.now(paris).date().isoformat()
+    paris     = timezone(timedelta(hours=2))
+    utc       = timezone.utc
+    now_paris = datetime.now(paris)
+    # Début du jour heure Paris → converti en UTC pour Supabase
+    debut_paris = now_paris.replace(hour=0, minute=0, second=0, microsecond=0)
+    debut_utc   = debut_paris.astimezone(utc)
+    debut_str   = debut_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # Si on a les deux soldes, on compare
     if solde_avant is not None and solde_apres is not None and solde_avant > 0:
-        diff_sim = solde_apres - solde_avant  # négatif = SIM a diminué
-        if diff_sim < 0:
-            # SIM diminue → client a déposé → cash augmente
-            delta = amount
-        else:
-            # SIM augmente → client a retiré → cash diminue
-            delta = -amount
+        diff_sim = solde_apres - solde_avant
+        delta    = amount if diff_sim < 0 else -amount
     else:
-        # Fallback sur la raison si pas de solde disponible
         if raison == "momo_depot":
             delta = +amount
-        elif raison in ("momo_retrait", "momo_transfert",
-                        "momo_paiement", "momo_envoi"):
+        elif raison in ("momo_retrait","momo_transfert",
+                        "momo_paiement","momo_envoi"):
             delta = -amount
         else:
             print(f"⏭️  raison={raison} sans solde — ignoré")
@@ -164,7 +157,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     try:
         res = supabase.table("cash_sessions").select("*")\
                       .eq("account_id", account_id)\
-                      .gte("created_at", f"{aujourd_hui}T00:00:00")\
+                      .gte("created_at", debut_str)\
                       .order("created_at", desc=True)\
                       .limit(1).execute()
 
@@ -176,11 +169,12 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
             supabase.table("cash_sessions")\
                     .update({"current_cash": nouveau})\
                     .eq("id", sess["id"]).execute()
-            sens = "↑ cash+" if delta > 0 else "↓ cash-"
-            print(f"💵 {sens}{abs(delta)} F | {current} → {nouveau} F "
-                  f"| SIM {solde_avant}→{solde_apres} | {raison}")
+            sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
+            print(f"💵 cash {sens} F | {current} → {nouveau} F "
+                  f"| SIM {solde_avant}→{solde_apres}")
         else:
             print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
+            print(f"   debut_utc={debut_str} — caissier doit saisir le départ")
     except Exception as e:
         print(f"⚠️  Erreur maj_current_cash : {e}")
 
