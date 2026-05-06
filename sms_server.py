@@ -132,25 +132,23 @@ def parser_sms(message: str, sender: str) -> dict:
 
 def maj_current_cash(account_id: int, amount: int, raison: str):
     """
-    Met à jour current_cash dans cash_sessions du jour.
-    momo_depot   → cash physique augmente (+amount)
-    momo_retrait/momo_transfert → cash physique diminue (-amount)
+    DEPOT  → client donne cash à l'agent → cash physique AUGMENTE
+    RETRAIT/TRANSFERT → agent donne cash au client → cash physique DIMINUE
     """
     from datetime import datetime, timezone, timedelta
     paris = timezone(timedelta(hours=2))
     aujourd_hui = datetime.now(paris).date().isoformat()
 
-    # Déterminer le delta
     if raison == "momo_depot":
-        delta = amount
+        delta = +amount   # Cash augmente
     elif raison in ("momo_retrait", "momo_transfert",
                     "momo_paiement", "momo_envoi"):
-        delta = -amount
+        delta = -amount   # Cash diminue
     else:
-        return  # Pas de mise à jour pour les autres raisons
+        print(f"⏭️  raison={raison} — pas de maj cash")
+        return
 
     try:
-        # Chercher session du jour
         res = supabase.table("cash_sessions").select("*")\
                       .eq("account_id", account_id)\
                       .gte("created_at", f"{aujourd_hui}T00:00:00")\
@@ -158,17 +156,17 @@ def maj_current_cash(account_id: int, amount: int, raison: str):
                       .limit(1).execute()
 
         if res.data:
-            sess = res.data[0]
+            sess    = res.data[0]
             current = float(sess.get("current_cash") or
                            sess.get("opening_cash") or 0)
             nouveau = max(0, current + delta)
             supabase.table("cash_sessions")\
                     .update({"current_cash": nouveau})\
                     .eq("id", sess["id"]).execute()
-            print(f"💵 current_cash {current} → {nouveau} F "
-                  f"(delta: {delta:+} | {raison})")
+            print(f"💵 cash {current} → {nouveau} F  (delta:{delta:+} | {raison})")
         else:
-            print(f"⚠️  Pas de session cash du jour pour account_id={account_id}")
+            print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
+            print(f"   Le caissier doit saisir le montant de départ d'abord.")
     except Exception as e:
         print(f"⚠️  Erreur maj_current_cash : {e}")
 
