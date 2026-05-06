@@ -130,23 +130,36 @@ def parser_sms(message: str, sender: str) -> dict:
 
     return result
 
-def maj_current_cash(account_id: int, amount: int, raison: str):
+def maj_current_cash(account_id: int, amount: int, raison: str,
+                     solde_avant: int, solde_apres: int):
     """
-    DEPOT  → client donne cash à l'agent → cash physique AUGMENTE
-    RETRAIT/TRANSFERT → agent donne cash au client → cash physique DIMINUE
+    Règle absolue basée sur le solde SIM :
+    - Solde SIM diminue → agent a reçu du cash → cash AUGMENTE
+    - Solde SIM augmente → agent a donné du cash → cash DIMINUE
     """
     from datetime import datetime, timezone, timedelta
     paris = timezone(timedelta(hours=2))
     aujourd_hui = datetime.now(paris).date().isoformat()
 
-    if raison == "momo_depot":
-        delta = +amount   # Cash augmente
-    elif raison in ("momo_retrait", "momo_transfert",
-                    "momo_paiement", "momo_envoi"):
-        delta = -amount   # Cash diminue
+    # Si on a les deux soldes, on compare
+    if solde_avant is not None and solde_apres is not None and solde_avant > 0:
+        diff_sim = solde_apres - solde_avant  # négatif = SIM a diminué
+        if diff_sim < 0:
+            # SIM diminue → client a déposé → cash augmente
+            delta = amount
+        else:
+            # SIM augmente → client a retiré → cash diminue
+            delta = -amount
     else:
-        print(f"⏭️  raison={raison} — pas de maj cash")
-        return
+        # Fallback sur la raison si pas de solde disponible
+        if raison == "momo_depot":
+            delta = +amount
+        elif raison in ("momo_retrait", "momo_transfert",
+                        "momo_paiement", "momo_envoi"):
+            delta = -amount
+        else:
+            print(f"⏭️  raison={raison} sans solde — ignoré")
+            return
 
     try:
         res = supabase.table("cash_sessions").select("*")\
@@ -163,10 +176,11 @@ def maj_current_cash(account_id: int, amount: int, raison: str):
             supabase.table("cash_sessions")\
                     .update({"current_cash": nouveau})\
                     .eq("id", sess["id"]).execute()
-            print(f"💵 cash {current} → {nouveau} F  (delta:{delta:+} | {raison})")
+            sens = "↑ cash+" if delta > 0 else "↓ cash-"
+            print(f"💵 {sens}{abs(delta)} F | {current} → {nouveau} F "
+                  f"| SIM {solde_avant}→{solde_apres} | {raison}")
         else:
             print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
-            print(f"   Le caissier doit saisir le montant de départ d'abord.")
     except Exception as e:
         print(f"⚠️  Erreur maj_current_cash : {e}")
 
@@ -219,18 +233,32 @@ async def recevoir_sms(request: Request):
         return {"status": "ignored"}
 
     try:
-        payload = {k: v for k, v in parsed.items() if v is not None}
-        res = supabase.table("transactions").insert(payload).execute()
-        id_ins = res.data[0].get("id", "?") if res.data else "?"
-        print(f"✅ transactions ID:{id_ins} | {parsed.get('raison')} | "
-              f"{parsed.get('amount')} F | solde:{parsed.get('solde')} F")
+        # Récupérer le dernier solde SIM avant cette transaction
+        try:
+            res_prev = supabase.table("transactions")\
+                               .select("solde")\
+                               .eq("account_id", parsed["account_id"])\
+                               .not_.is_("solde", "null")\
+                               .order("created_at", desc=True)\
+                               .limit(1).execute()
+            solde_avant = int(res_prev.data[0]["solde"]) \
+                          if res_prev.data else None
+        except: solde_avant = None
 
-        # Mettre à jour current_cash automatiquement
+        payload = {k: v for k, v in parsed.items() if v is not None}
+        res     = supabase.table("transactions").insert(payload).execute()
+        id_ins  = res.data[0].get("id","?") if res.data else "?"
+        solde_apres = parsed.get("solde")
+        print(f"✅ transactions ID:{id_ins} | {parsed.get('raison')} | "
+              f"{parsed.get('amount')} F | SIM:{solde_avant}→{solde_apres}")
+
         if parsed.get("amount") and parsed.get("account_id"):
             maj_current_cash(
                 parsed["account_id"],
                 parsed["amount"],
-                parsed["raison"])
+                parsed["raison"],
+                solde_avant,
+                solde_apres)
 
         return {"status": "ok", "id": id_ins}
 
@@ -250,7 +278,9 @@ async def recevoir_sms(request: Request):
             id2 = res2.data[0].get("id", "?") if res2.data else "?"
             print(f"✅ minimal ID:{id2}")
             if parsed.get("amount") and parsed.get("account_id"):
-                maj_current_cash(parsed["account_id"], parsed["amount"], parsed["raison"])
+                maj_current_cash(parsed["account_id"], parsed["amount"],
+                                 parsed["raison"], solde_avant,
+                                 parsed.get("solde"))
             return {"status": "ok_minimal", "id": id2}
         except Exception as e2:
             print(f"❌ Erreur finale : {e2}")
@@ -266,6 +296,7 @@ def test_sms(sms: SMS):
     res = supabase.table("transactions").insert(payload).execute()
     id_t = res.data[0].get("id", "?") if res.data else "?"
     if parsed.get("amount") and parsed.get("account_id"):
-        maj_current_cash(parsed["account_id"], parsed["amount"], parsed["raison"])
+        maj_current_cash(parsed["account_id"], parsed["amount"],
+                         parsed["raison"], None, parsed.get("solde"))
     print(f"✅ TEST ID:{id_t}")
     return {"status": "test_ok", "id": id_t, "parsed": parsed}
