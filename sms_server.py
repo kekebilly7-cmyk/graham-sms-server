@@ -158,7 +158,8 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         res = supabase.table("cash_sessions").select("*")\
                       .eq("account_id", account_id)\
                       .gte("created_at", debut_str)\
-                      .order("created_at", desc=True)\
+                      .gt("opening_cash", 0)\
+                      .order("created_at", desc=False)\
                       .limit(1).execute()
 
         if res.data:
