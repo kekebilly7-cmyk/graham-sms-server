@@ -163,8 +163,12 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
 
         if res.data:
             sess    = res.data[0]
-            current = float(sess.get("current_cash") or
-                           sess.get("opening_cash") or 0)
+            opening = float(sess.get("opening_cash") or 0)
+            # Ne calculer que si le caissier a saisi un solde de départ
+            if opening <= 0:
+                print(f"⏭️  Solde départ non saisi — calcul cash ignoré")
+                return
+            current = float(sess.get("current_cash") or opening)
             nouveau = max(0, current + delta)
             supabase.table("cash_sessions")\
                     .update({"current_cash": nouveau})\
