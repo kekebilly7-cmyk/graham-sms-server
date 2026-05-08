@@ -164,17 +164,21 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         if res.data:
             sess    = res.data[0]
             opening = float(sess.get("opening_cash") or 0)
-            # Ne calculer que si le caissier a saisi un solde de départ
             if opening <= 0:
-                print(f"⏭️  Solde départ non saisi — calcul cash ignoré")
+                print(f"⏭️  Solde départ non saisi — ignoré")
                 return
-            current = float(sess.get("current_cash") or opening)
+            _cc = sess.get("current_cash")
+            current = float(_cc) if _cc is not None else opening
+            # Si cash épuisé (= 0) → pause totale, ignorer la transaction
+            if current == 0:
+                print(f"⏭️  Cash épuisé (0 F) — transaction ignorée")
+                return
             nouveau = max(0, current + delta)
             supabase.table("cash_sessions")\
                     .update({"current_cash": nouveau})\
                     .eq("id", sess["id"]).execute()
             sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
-            print(f"💵 cash {sens} F | {current} → {nouveau} F "
+            print(f"💵 {sens} F | {current} → {nouveau} F "
                   f"| SIM {solde_avant}→{solde_apres}")
         else:
             print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
