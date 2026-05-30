@@ -1,25 +1,39 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from supabase import create_client
+import os
 import re
 import json as _json
 import urllib.request as _req
 import urllib.error as _uerr
 
-app = FastAPI()
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+from supabase import create_client
 
-SUPABASE_URL = "https://cjwbryhwfofpoopcbmpn.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqd2JyeWh3Zm9mcG9vcGNibXBuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNjYwNjMsImV4cCI6MjA5MTk0MjA2M30.rCjCQdFfHzbKf12XAIrwbOTkVCPcdEqOXD7WiBno4Uk"
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ── Chargement .env local (dev) — ignoré sur Render (variables d'env Render) ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv pas installé → pas grave, Render injecte les vars
 
+# ════════════════════════════════════════════════════════════════════
+# CONFIGURATION — tout vient des variables d'environnement
+# ════════════════════════════════════════════════════════════════════
+CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "")
+SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
+
+CLAUDE_SEUIL_CONFIANCE = 0.75
+
+# Validation au démarrage
+if not CLAUDE_API_KEY:
+    print("⚠️  CLAUDE_API_KEY non définie → fallback classique uniquement")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌  SUPABASE_URL ou SUPABASE_KEY non définie !")
+
+supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
 ACCOUNT_IDS = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "ORANGE": 4}
 
-# ════════════════════════════════════════════════════════════════════
-# CLÉ API CLAUDE — Remplace par ta nouvelle clé après avoir
-# supprimé l'ancienne sur console.anthropic.com
-# ════════════════════════════════════════════════════════════════════
-CLAUDE_API_KEY = "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 "
-CLAUDE_SEUIL_CONFIANCE = 0.75  # En dessous → fallback classique
+app = FastAPI()
 
 
 class SMS(BaseModel):
@@ -38,14 +52,16 @@ def est_financier(msg: str) -> bool:
 
 # ════════════════════════════════════════════════════════════════════
 # LOGIQUE 1 — ANALYSE IA (Claude API)
-# Retourne un dict enrichi ou None si l'IA est indisponible
 # ════════════════════════════════════════════════════════════════════
 def analyser_sms_ia(message: str) -> dict | None:
     """
-    Envoie le SMS brut à Claude pour analyse structurée.
-    Retourne un dict ou None si l'IA échoue / timeout / réseau coupé.
-    Le fallback classique prend le relais automatiquement.
+    Analyse le SMS avec Claude API.
+    Retourne un dict structuré ou None si indisponible.
     """
+    if not CLAUDE_API_KEY:
+        print("[IA] Clé API non configurée → fallback classique")
+        return None
+
     if not message or not message.strip():
         return None
 
@@ -83,7 +99,7 @@ Règles :
 - phone_number : format 229XXXXXXXXX ou "" si absent
 - nom_destinataire : nom de la personne concernée ou "" si absent
 - reference_id : ID/référence transaction ou "" si absent
-- confiance : float 0.0 à 1.0 selon ta certitude sur la classification
+- confiance : float 0.0 à 1.0 selon ta certitude
 - sender : "MTN", "MOOV", "CELTIS", "ORANGE" ou "MTN" par défaut"""
 
     try:
@@ -107,13 +123,11 @@ Règles :
         with _req.urlopen(request, timeout=8) as resp:
             data = _json.loads(resp.read().decode())
 
-        # Extraire le texte brut
         texte = ""
         for bloc in data.get("content", []):
             if bloc.get("type") == "text":
                 texte += bloc["text"]
 
-        # Nettoyer les éventuels backticks markdown
         texte = texte.strip()
         if "```" in texte:
             parties = texte.split("```")
@@ -127,7 +141,6 @@ Règles :
 
         resultat = _json.loads(texte.strip())
 
-        # Valider les champs obligatoires
         champs_requis = ["raison","sender","amount","frais","solde",
                          "phone_number","nom_destinataire",
                          "reference_id","confiance"]
@@ -136,20 +149,18 @@ Règles :
                 print(f"[IA] Champ manquant : {c}")
                 return None
 
-        # Forcer les bons types
         resultat["amount"]    = int(resultat.get("amount", 0) or 0)
         resultat["frais"]     = int(resultat.get("frais", 0) or 0)
         resultat["solde"]     = int(resultat.get("solde", 0) or 0)
         resultat["confiance"] = float(resultat.get("confiance", 0) or 0)
 
-        # Valeurs vides → None pour Supabase
         if not resultat.get("phone_number"):     resultat["phone_number"] = None
         if not resultat.get("nom_destinataire"): resultat["nom_destinataire"] = None
         if not resultat.get("reference_id"):     resultat["reference_id"] = None
         if not resultat.get("frais"):            resultat["frais"] = 0
         if not resultat.get("solde"):            resultat["solde"] = None
 
-        print(f"[IA] ✅ Résultat : {resultat['raison']} | "
+        print(f"[IA] ✅ {resultat['raison']} | "
               f"{resultat['amount']} F | confiance={resultat['confiance']:.0%}")
         return resultat
 
@@ -165,14 +176,10 @@ Règles :
 
 
 # ════════════════════════════════════════════════════════════════════
-# LOGIQUE 2 — ANALYSE CLASSIQUE (ton ancienne fonction, intacte)
-# Toujours disponible, jamais d'erreur réseau
+# LOGIQUE 2 — ANALYSE CLASSIQUE (original intact)
 # ════════════════════════════════════════════════════════════════════
 def parser_sms_classique(message: str, sender: str) -> dict:
-    """
-    Ton ancienne fonction parser_sms — 100% identique, renommée.
-    Utilisée si l'IA échoue ou si la confiance est insuffisante.
-    """
+    """Ancienne fonction parser_sms — 100% identique, toujours disponible."""
     msg = message.strip()
     result = {
         "raw_message": msg, "sender": None, "account_id": None,
@@ -284,54 +291,33 @@ def parser_sms_classique(message: str, sender: str) -> dict:
 # FONCTION PRINCIPALE — IA d'abord, classique en fallback
 # ════════════════════════════════════════════════════════════════════
 def parser_sms(message: str, sender: str) -> dict:
-    """
-    Point d'entrée unique pour analyser un SMS.
-
-    Étape 1 : tente l'analyse IA (Claude API, timeout 8s)
-      - Si IA répond ET confiance >= 0.75 → on utilise le résultat IA
-      - Sinon → fallback sur l'analyse classique
-
-    Étape 2 (fallback) : analyse classique (règles regex, toujours dispo)
-
-    Le résultat final est toujours compatible avec le format Supabase.
-    """
     msg = message.strip()
 
-    # ── Tentative IA ─────────────────────────────────────────────────
+    # Tentative IA
     resultat_ia = analyser_sms_ia(msg)
 
     if resultat_ia is not None and resultat_ia.get("confiance", 0) >= CLAUDE_SEUIL_CONFIANCE:
-        # ✅ IA réussie — construire le dict au format Supabase
         print(f"[Parser] ✅ Source : IA | raison={resultat_ia['raison']}")
-
-        # Résoudre account_id depuis sender détecté par l'IA
-        sender_ia = resultat_ia.get("sender", "MTN")
-        account_id = ACCOUNT_IDS.get(sender_ia)
-
-        # Garder raw_message et date_transaction du classique si besoin
-        # (l'IA ne les extrait pas forcément)
         classique = parser_sms_classique(msg, sender)
-
         return {
             "raw_message":      msg,
-            "sender":           sender_ia,
-            "account_id":       account_id,
+            "sender":           resultat_ia.get("sender", "MTN"),
+            "account_id":       ACCOUNT_IDS.get(resultat_ia.get("sender", "MTN")),
             "phone_number":     resultat_ia.get("phone_number"),
             "amount":           resultat_ia["amount"] if resultat_ia["amount"] > 0 else None,
             "reference_id":     resultat_ia.get("reference_id"),
             "nom_destinataire": resultat_ia.get("nom_destinataire"),
             "solde":            resultat_ia.get("solde"),
             "frais":            resultat_ia.get("frais", 0),
-            "date_transaction": classique.get("date_transaction"),  # regex fiable
+            "date_transaction": classique.get("date_transaction"),
             "raison":           resultat_ia["raison"],
             "source_analyse":   "ia",
             "confiance_ia":     resultat_ia["confiance"],
         }
 
-    # ── Fallback classique ────────────────────────────────────────────
+    # Fallback classique
     raison_fallback = "faible confiance" if resultat_ia else "IA indisponible"
     print(f"[Parser] ⚠️  Fallback classique ({raison_fallback})")
-
     classique = parser_sms_classique(msg, sender)
     classique["source_analyse"] = "classique"
     classique["confiance_ia"]   = resultat_ia.get("confiance", 0.0) if resultat_ia else 0.0
@@ -339,14 +325,14 @@ def parser_sms(message: str, sender: str) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════
-# maj_current_cash — identique à ton original
+# maj_current_cash — identique à l'original
 # ════════════════════════════════════════════════════════════════════
 def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_avant: int, solde_apres: int):
     from datetime import datetime, timezone, timedelta
-    paris     = timezone(timedelta(hours=2))
-    utc       = timezone.utc
-    now_paris = datetime.now(paris)
+    paris       = timezone(timedelta(hours=2))
+    utc         = timezone.utc
+    now_paris   = datetime.now(paris)
     debut_paris = now_paris.replace(hour=0, minute=0, second=0, microsecond=0)
     debut_utc   = debut_paris.astimezone(utc)
     debut_str   = debut_utc.strftime("%Y-%m-%dT%H:%M:%S")
@@ -378,7 +364,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
             if opening <= 0:
                 print(f"⏭️  Solde départ non saisi — ignoré")
                 return
-            _cc = sess.get("current_cash")
+            _cc     = sess.get("current_cash")
             current = float(_cc) if _cc is not None else opening
             if current == 0:
                 print(f"⏭️  Cash épuisé (0 F) — transaction ignorée")
@@ -392,18 +378,22 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                   f"| SIM {solde_avant}→{solde_apres}")
         else:
             print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
-            print(f"   debut_utc={debut_str} — caissier doit saisir le départ")
     except Exception as e:
         print(f"⚠️  Erreur maj_current_cash : {e}")
 
 
 # ════════════════════════════════════════════════════════════════════
-# ROUTES FastAPI — identiques à l'original
+# ROUTES FastAPI
 # ════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def home():
-    return {"message": "✅ Graham POS SMS Server v4-IA — opérationnel"}
+    ia_status = "✅ configurée" if CLAUDE_API_KEY else "⚠️  non configurée"
+    return {
+        "message":    "✅ Graham POS SMS Server v4-IA — opérationnel",
+        "ia_status":  ia_status,
+        "supabase":   "✅ connecté" if SUPABASE_URL else "❌ non configuré",
+    }
 
 
 @app.post("/sms")
@@ -420,14 +410,14 @@ async def recevoir_sms(request: Request):
     print("📩 Body :", body)
 
     message = (body.get("message") or body.get("text") or
-               body.get("body") or body.get("sms") or
-               body.get("key") or "").strip()
-    sender = (body.get("sender") or body.get("from") or
-              body.get("number") or "").strip()
+               body.get("body")    or body.get("sms") or
+               body.get("key")     or "").strip()
+    sender  = (body.get("sender")  or body.get("from") or
+               body.get("number")  or "").strip()
 
     if not message and "key" in body:
         key_val = str(body["key"])
-        lignes = key_val.split("\n", 1)
+        lignes  = key_val.split("\n", 1)
         if len(lignes) == 2:
             m_num = re.search(r'[\+\d]{8,15}', lignes[0])
             if m_num and not sender:
@@ -443,7 +433,6 @@ async def recevoir_sms(request: Request):
         print("⏭️  SMS non financier — ignoré")
         return {"status": "ignored", "reason": "non_financier"}
 
-    # ── Analyse SMS (IA + fallback classique) ────────────────────────
     parsed = parser_sms(message, sender)
     print(f"✅ Parsed [{parsed.get('source_analyse','?')}] : {parsed}")
 
@@ -452,33 +441,28 @@ async def recevoir_sms(request: Request):
         return {"status": "ignored"}
 
     try:
-        # Récupérer solde SIM avant
         try:
-            res_prev = supabase.table("transactions")\
-                               .select("solde")\
-                               .eq("account_id", parsed["account_id"])\
-                               .not_.is_("solde", "null")\
-                               .order("created_at", desc=True)\
-                               .limit(1).execute()
-            solde_avant = int(res_prev.data[0]["solde"]) \
-                          if res_prev.data else None
-        except: solde_avant = None
+            res_prev    = supabase.table("transactions")\
+                                  .select("solde")\
+                                  .eq("account_id", parsed["account_id"])\
+                                  .not_.is_("solde", "null")\
+                                  .order("created_at", desc=True)\
+                                  .limit(1).execute()
+            solde_avant = int(res_prev.data[0]["solde"]) if res_prev.data else None
+        except:
+            solde_avant = None
 
         payload = {k: v for k, v in parsed.items() if v is not None}
         res     = supabase.table("transactions").insert(payload).execute()
         id_ins  = res.data[0].get("id","?") if res.data else "?"
         solde_apres = parsed.get("solde")
-        print(f"✅ transactions ID:{id_ins} | {parsed.get('raison')} | "
-              f"{parsed.get('amount')} F | SIM:{solde_avant}→{solde_apres} "
-              f"| source={parsed.get('source_analyse','?')}")
+
+        print(f"✅ ID:{id_ins} | {parsed.get('raison')} | "
+              f"{parsed.get('amount')} F | source={parsed.get('source_analyse','?')}")
 
         if parsed.get("amount") and parsed.get("account_id"):
-            maj_current_cash(
-                parsed["account_id"],
-                parsed["amount"],
-                parsed["raison"],
-                solde_avant,
-                solde_apres)
+            maj_current_cash(parsed["account_id"], parsed["amount"],
+                             parsed["raison"], solde_avant, solde_apres)
 
         return {"status": "ok", "id": id_ins,
                 "source_analyse": parsed.get("source_analyse", "?")}
@@ -492,16 +476,15 @@ async def recevoir_sms(request: Request):
                 "account_id":  parsed.get("account_id"),
                 "raison":      parsed.get("raison", "inconnu"),
             }
-            if parsed.get("amount"):        p_min["amount"]       = parsed["amount"]
-            if parsed.get("phone_number"):  p_min["phone_number"] = parsed["phone_number"]
-            if parsed.get("reference_id"):  p_min["reference_id"] = parsed["reference_id"]
+            if parsed.get("amount"):       p_min["amount"]       = parsed["amount"]
+            if parsed.get("phone_number"): p_min["phone_number"] = parsed["phone_number"]
+            if parsed.get("reference_id"): p_min["reference_id"] = parsed["reference_id"]
             res2 = supabase.table("transactions").insert(p_min).execute()
-            id2  = res2.data[0].get("id", "?") if res2.data else "?"
+            id2  = res2.data[0].get("id","?") if res2.data else "?"
             print(f"✅ minimal ID:{id2}")
             if parsed.get("amount") and parsed.get("account_id"):
                 maj_current_cash(parsed["account_id"], parsed["amount"],
-                                 parsed["raison"], solde_avant,
-                                 parsed.get("solde"))
+                                 parsed["raison"], solde_avant, parsed.get("solde"))
             return {"status": "ok_minimal", "id": id2}
         except Exception as e2:
             print(f"❌ Erreur finale : {e2}")
@@ -510,33 +493,24 @@ async def recevoir_sms(request: Request):
 
 @app.post("/sms/test")
 def test_sms(sms: SMS):
-    msg = sms.message or \
-          "Transfert 5000F a KEKE BILLY(22961000000) 2026-05-06 10:07:36 " \
-          "Frais:0F Solde:47088F ID:12002009086"
+    msg    = sms.message or \
+             "Transfert 5000F a KEKE BILLY(22961000000) 2026-05-06 10:07:36 " \
+             "Frais:0F Solde:47088F ID:12002009086"
     parsed = parser_sms(msg, sms.sender or "MTN")
     payload = {k: v for k, v in parsed.items() if v is not None}
-    res = supabase.table("transactions").insert(payload).execute()
-    id_t = res.data[0].get("id", "?") if res.data else "?"
+    res  = supabase.table("transactions").insert(payload).execute()
+    id_t = res.data[0].get("id","?") if res.data else "?"
     if parsed.get("amount") and parsed.get("account_id"):
         maj_current_cash(parsed["account_id"], parsed["amount"],
                          parsed["raison"], None, parsed.get("solde"))
     print(f"✅ TEST ID:{id_t} | source={parsed.get('source_analyse','?')}")
-    return {
-        "status":         "test_ok",
-        "id":             id_t,
-        "parsed":         parsed,
-        "source_analyse": parsed.get("source_analyse", "?"),
-    }
+    return {"status": "test_ok", "id": id_t, "parsed": parsed,
+            "source_analyse": parsed.get("source_analyse","?")}
 
 
-# ── Route diagnostic IA (pour tester sans insérer en base) ──────────
 @app.post("/sms/test-ia")
 async def test_ia_seul(request: Request):
-    """
-    Teste uniquement l'analyse IA sans insérer en base.
-    Utile pour vérifier que la clé API fonctionne.
-    Body : {"message": "ton SMS ici"}
-    """
+    """Teste l'analyse sans insérer en base. Utile pour vérifier la clé API."""
     try:
         body = await request.json()
     except:
@@ -550,10 +524,11 @@ async def test_ia_seul(request: Request):
     classique   = parser_sms_classique(msg, "")
 
     return {
-        "ia":        resultat_ia,
-        "classique": classique,
+        "ia":             resultat_ia,
+        "classique":      classique,
         "source_utilisee": "ia" if (
             resultat_ia and
             resultat_ia.get("confiance", 0) >= CLAUDE_SEUIL_CONFIANCE
-        ) else "classique"
+        ) else "classique",
+        "ia_configuree":  bool(CLAUDE_API_KEY),
     }
