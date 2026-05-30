@@ -8,23 +8,22 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from supabase import create_client
 
-# ── Chargement .env local (dev) — ignoré sur Render (variables d'env Render) ──
+# ── Chargement .env local (dev) ──────────────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv pas installé → pas grave, Render injecte les vars
+    pass
 
 # ════════════════════════════════════════════════════════════════════
-# CONFIGURATION — tout vient des variables d'environnement
+# CONFIGURATION — variables d'environnement uniquement
 # ════════════════════════════════════════════════════════════════════
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "")
 SUPABASE_URL    = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY    = os.environ.get("SUPABASE_KEY", "")
 
-CLAUDE_SEUIL_CONFIANCE = 0.75
+CLAUDE_SEUIL_CONFIANCE = 0.75   # En dessous → statut pending
 
-# Validation au démarrage
 if not CLAUDE_API_KEY:
     print("⚠️  CLAUDE_API_KEY non définie → fallback classique uniquement")
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -41,6 +40,10 @@ class SMS(BaseModel):
     sender:  str = ""
 
 
+# ════════════════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════════════════
+
 def est_financier(msg: str) -> bool:
     a_montant = bool(re.search(r'\d+\s*(?:FCFA|XOF|F\b)', msg, re.IGNORECASE))
     mots = ["transfert","transfer","depot","dépôt","reçu","recu",
@@ -50,18 +53,44 @@ def est_financier(msg: str) -> bool:
     return a_montant and a_mot
 
 
+def reseau_est_actif(account_id: int) -> bool:
+    """
+    Vérifie si le réseau est ON (actif=true) dans cash_sessions.
+    Si aucune session du jour → considéré actif (pas encore ouvert).
+    Si session trouvée et actif=False → réseau OFF, on n'update pas le cash.
+    """
+    from datetime import datetime, timezone, timedelta
+    paris     = timezone(timedelta(hours=2))
+    utc       = timezone.utc
+    now_paris = datetime.now(paris)
+    debut_paris = now_paris.replace(hour=0, minute=0, second=0, microsecond=0)
+    debut_utc   = debut_paris.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        res = supabase.table("cash_sessions").select("actif") \
+                      .eq("account_id", account_id) \
+                      .gte("created_at", debut_utc) \
+                      .gt("opening_cash", 0) \
+                      .order("created_at", desc=False) \
+                      .limit(1).execute()
+        if res.data:
+            # actif peut être None (colonne pas encore remplie) → traiter comme True
+            valeur = res.data[0].get("actif", True)
+            if valeur is False:
+                return False
+        return True
+    except Exception as e:
+        print(f"[reseau_actif] erreur : {e}")
+        return True   # en cas d'erreur → ne pas bloquer
+
+
 # ════════════════════════════════════════════════════════════════════
 # LOGIQUE 1 — ANALYSE IA (Claude API)
 # ════════════════════════════════════════════════════════════════════
+
 def analyser_sms_ia(message: str) -> dict | None:
-    """
-    Analyse le SMS avec Claude API.
-    Retourne un dict structuré ou None si indisponible.
-    """
     if not CLAUDE_API_KEY:
         print("[IA] Clé API non configurée → fallback classique")
         return None
-
     if not message or not message.strip():
         return None
 
@@ -81,7 +110,7 @@ Règles de classification pour le champ "raison" :
 - "momo_transaction": transaction générique si type indéterminé
 - "inconnu"         : impossible à classifier
 
-Retourne exactement ce JSON (tous les champs sont obligatoires) :
+Retourne exactement ce JSON (tous les champs obligatoires) :
 {{
   "raison":           "momo_depot",
   "sender":           "MTN",
@@ -97,8 +126,6 @@ Retourne exactement ce JSON (tous les champs sont obligatoires) :
 Règles :
 - amount, frais, solde : entiers en FCFA (0 si absent)
 - phone_number : format 229XXXXXXXXX ou "" si absent
-- nom_destinataire : nom de la personne concernée ou "" si absent
-- reference_id : ID/référence transaction ou "" si absent
 - confiance : float 0.0 à 1.0 selon ta certitude
 - sender : "MTN", "MOOV", "CELTIS", "ORANGE" ou "MTN" par défaut"""
 
@@ -111,15 +138,13 @@ Règles :
 
         request = _req.Request(
             "https://api.anthropic.com/v1/messages",
-            data=payload,
-            method="POST",
+            data=payload, method="POST",
             headers={
                 "Content-Type":      "application/json",
                 "x-api-key":         CLAUDE_API_KEY,
                 "anthropic-version": "2023-06-01",
             }
         )
-
         with _req.urlopen(request, timeout=8) as resp:
             data = _json.loads(resp.read().decode())
 
@@ -130,35 +155,29 @@ Règles :
 
         texte = texte.strip()
         if "```" in texte:
-            parties = texte.split("```")
-            for p in parties:
+            for p in texte.split("```"):
                 p = p.strip()
-                if p.startswith("json"):
-                    p = p[4:].strip()
-                if p.startswith("{"):
-                    texte = p
-                    break
+                if p.startswith("json"): p = p[4:].strip()
+                if p.startswith("{"): texte = p; break
 
         resultat = _json.loads(texte.strip())
 
-        champs_requis = ["raison","sender","amount","frais","solde",
-                         "phone_number","nom_destinataire",
-                         "reference_id","confiance"]
-        for c in champs_requis:
+        for c in ["raison","sender","amount","frais","solde",
+                  "phone_number","nom_destinataire","reference_id","confiance"]:
             if c not in resultat:
                 print(f"[IA] Champ manquant : {c}")
                 return None
 
-        resultat["amount"]    = int(resultat.get("amount", 0) or 0)
-        resultat["frais"]     = int(resultat.get("frais", 0) or 0)
-        resultat["solde"]     = int(resultat.get("solde", 0) or 0)
+        resultat["amount"]    = int(resultat.get("amount",    0) or 0)
+        resultat["frais"]     = int(resultat.get("frais",     0) or 0)
+        resultat["solde"]     = int(resultat.get("solde",     0) or 0)
         resultat["confiance"] = float(resultat.get("confiance", 0) or 0)
 
-        if not resultat.get("phone_number"):     resultat["phone_number"] = None
+        if not resultat.get("phone_number"):     resultat["phone_number"]     = None
         if not resultat.get("nom_destinataire"): resultat["nom_destinataire"] = None
-        if not resultat.get("reference_id"):     resultat["reference_id"] = None
-        if not resultat.get("frais"):            resultat["frais"] = 0
-        if not resultat.get("solde"):            resultat["solde"] = None
+        if not resultat.get("reference_id"):     resultat["reference_id"]     = None
+        if not resultat.get("frais"):            resultat["frais"]            = 0
+        if not resultat.get("solde"):            resultat["solde"]            = None
 
         print(f"[IA] ✅ {resultat['raison']} | "
               f"{resultat['amount']} F | confiance={resultat['confiance']:.0%}")
@@ -178,8 +197,8 @@ Règles :
 # ════════════════════════════════════════════════════════════════════
 # LOGIQUE 2 — ANALYSE CLASSIQUE (original intact)
 # ════════════════════════════════════════════════════════════════════
+
 def parser_sms_classique(message: str, sender: str) -> dict:
-    """Ancienne fonction parser_sms — 100% identique, toujours disponible."""
     msg = message.strip()
     result = {
         "raw_message": msg, "sender": None, "account_id": None,
@@ -290,10 +309,10 @@ def parser_sms_classique(message: str, sender: str) -> dict:
 # ════════════════════════════════════════════════════════════════════
 # FONCTION PRINCIPALE — IA d'abord, classique en fallback
 # ════════════════════════════════════════════════════════════════════
+
 def parser_sms(message: str, sender: str) -> dict:
     msg = message.strip()
 
-    # Tentative IA
     resultat_ia = analyser_sms_ia(msg)
 
     if resultat_ia is not None and resultat_ia.get("confiance", 0) >= CLAUDE_SEUIL_CONFIANCE:
@@ -313,6 +332,8 @@ def parser_sms(message: str, sender: str) -> dict:
             "raison":           resultat_ia["raison"],
             "source_analyse":   "ia",
             "confiance_ia":     resultat_ia["confiance"],
+            # statut déterminé par la confiance
+            "statut":           "confirmed",
         }
 
     # Fallback classique
@@ -321,21 +342,43 @@ def parser_sms(message: str, sender: str) -> dict:
     classique = parser_sms_classique(msg, sender)
     classique["source_analyse"] = "classique"
     classique["confiance_ia"]   = resultat_ia.get("confiance", 0.0) if resultat_ia else 0.0
+    # Si confiance faible → pending, si IA indispo → confirmed (classique fiable)
+    if resultat_ia and resultat_ia.get("confiance", 0) < CLAUDE_SEUIL_CONFIANCE:
+        classique["statut"] = "pending"
+        print(f"[Parser] 🟡 Confiance {resultat_ia['confiance']:.0%} < 75% → statut PENDING")
+    else:
+        classique["statut"] = "confirmed"
     return classique
 
 
 # ════════════════════════════════════════════════════════════════════
-# maj_current_cash — identique à l'original
+# maj_current_cash — vérifie reseau_est_actif avant de toucher au cash
 # ════════════════════════════════════════════════════════════════════
+
 def maj_current_cash(account_id: int, amount: int, raison: str,
-                     solde_avant: int, solde_apres: int):
+                     solde_avant: int, solde_apres: int,
+                     statut_transaction: str = "confirmed"):
+    """
+    Met à jour le cash physique UNIQUEMENT si :
+    1. Le réseau est ON (actif=True dans cash_sessions)
+    2. La transaction est confirmed (pas pending)
+    """
+    # ── Vérification ON/OFF ───────────────────────────────────────────
+    if not reseau_est_actif(account_id):
+        print(f"⏭️  Réseau account_id={account_id} est OFF → cash non mis à jour")
+        return
+
+    # ── Vérification statut transaction ──────────────────────────────
+    if statut_transaction == "pending":
+        print(f"⏭️  Transaction PENDING → cash non mis à jour (attente confirmation)")
+        return
+
     from datetime import datetime, timezone, timedelta
     paris       = timezone(timedelta(hours=2))
     utc         = timezone.utc
     now_paris   = datetime.now(paris)
     debut_paris = now_paris.replace(hour=0, minute=0, second=0, microsecond=0)
-    debut_utc   = debut_paris.astimezone(utc)
-    debut_str   = debut_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    debut_utc   = debut_paris.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     if solde_avant is not None and solde_apres is not None and solde_avant > 0:
         diff_sim = solde_apres - solde_avant
@@ -343,19 +386,18 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     else:
         if raison == "momo_depot":
             delta = +amount
-        elif raison in ("momo_retrait","momo_transfert",
-                        "momo_paiement","momo_envoi"):
+        elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
             delta = -amount
         else:
             print(f"⏭️  raison={raison} sans solde — ignoré")
             return
 
     try:
-        res = supabase.table("cash_sessions").select("*")\
-                      .eq("account_id", account_id)\
-                      .gte("created_at", debut_str)\
-                      .gt("opening_cash", 0)\
-                      .order("created_at", desc=False)\
+        res = supabase.table("cash_sessions").select("*") \
+                      .eq("account_id", account_id) \
+                      .gte("created_at", debut_utc) \
+                      .gt("opening_cash", 0) \
+                      .order("created_at", desc=False) \
                       .limit(1).execute()
 
         if res.data:
@@ -370,12 +412,11 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                 print(f"⏭️  Cash épuisé (0 F) — transaction ignorée")
                 return
             nouveau = max(0, current + delta)
-            supabase.table("cash_sessions")\
-                    .update({"current_cash": nouveau})\
+            supabase.table("cash_sessions") \
+                    .update({"current_cash": nouveau}) \
                     .eq("id", sess["id"]).execute()
             sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
-            print(f"💵 {sens} F | {current} → {nouveau} F "
-                  f"| SIM {solde_avant}→{solde_apres}")
+            print(f"💵 {sens} F | {current} → {nouveau} F | SIM {solde_avant}→{solde_apres}")
         else:
             print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
     except Exception as e:
@@ -390,9 +431,9 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
 def home():
     ia_status = "✅ configurée" if CLAUDE_API_KEY else "⚠️  non configurée"
     return {
-        "message":    "✅ Graham POS SMS Server v4-IA — opérationnel",
-        "ia_status":  ia_status,
-        "supabase":   "✅ connecté" if SUPABASE_URL else "❌ non configuré",
+        "message":   "✅ Graham POS SMS Server v5 — opérationnel",
+        "ia_status": ia_status,
+        "supabase":  "✅ connecté" if SUPABASE_URL else "❌ non configuré",
     }
 
 
@@ -434,7 +475,8 @@ async def recevoir_sms(request: Request):
         return {"status": "ignored", "reason": "non_financier"}
 
     parsed = parser_sms(message, sender)
-    print(f"✅ Parsed [{parsed.get('source_analyse','?')}] : {parsed}")
+    print(f"✅ Parsed [{parsed.get('source_analyse','?')}] "
+          f"statut={parsed.get('statut','?')} : {parsed}")
 
     if parsed["raison"] == "test_non_resolu":
         print("⚠️  Template non résolu — ignoré")
@@ -442,11 +484,11 @@ async def recevoir_sms(request: Request):
 
     try:
         try:
-            res_prev    = supabase.table("transactions")\
-                                  .select("solde")\
-                                  .eq("account_id", parsed["account_id"])\
-                                  .not_.is_("solde", "null")\
-                                  .order("created_at", desc=True)\
+            res_prev    = supabase.table("transactions") \
+                                  .select("solde") \
+                                  .eq("account_id", parsed["account_id"]) \
+                                  .not_.is_("solde", "null") \
+                                  .order("created_at", desc=True) \
                                   .limit(1).execute()
             solde_avant = int(res_prev.data[0]["solde"]) if res_prev.data else None
         except:
@@ -456,16 +498,25 @@ async def recevoir_sms(request: Request):
         res     = supabase.table("transactions").insert(payload).execute()
         id_ins  = res.data[0].get("id","?") if res.data else "?"
         solde_apres = parsed.get("solde")
+        statut_tx   = parsed.get("statut", "confirmed")
 
         print(f"✅ ID:{id_ins} | {parsed.get('raison')} | "
-              f"{parsed.get('amount')} F | source={parsed.get('source_analyse','?')}")
+              f"{parsed.get('amount')} F | statut={statut_tx} | "
+              f"source={parsed.get('source_analyse','?')}")
 
+        # Maj cash uniquement si confirmed ET réseau actif
         if parsed.get("amount") and parsed.get("account_id"):
-            maj_current_cash(parsed["account_id"], parsed["amount"],
-                             parsed["raison"], solde_avant, solde_apres)
+            maj_current_cash(
+                parsed["account_id"], parsed["amount"],
+                parsed["raison"], solde_avant, solde_apres,
+                statut_transaction=statut_tx)
 
-        return {"status": "ok", "id": id_ins,
-                "source_analyse": parsed.get("source_analyse", "?")}
+        return {
+            "status":         "ok",
+            "id":             id_ins,
+            "statut_tx":      statut_tx,
+            "source_analyse": parsed.get("source_analyse", "?"),
+        }
 
     except Exception as e1:
         print(f"❌ Erreur : {e1}")
@@ -475,6 +526,7 @@ async def recevoir_sms(request: Request):
                 "sender":      parsed.get("sender", "MTN"),
                 "account_id":  parsed.get("account_id"),
                 "raison":      parsed.get("raison", "inconnu"),
+                "statut":      parsed.get("statut", "confirmed"),
             }
             if parsed.get("amount"):       p_min["amount"]       = parsed["amount"]
             if parsed.get("phone_number"): p_min["phone_number"] = parsed["phone_number"]
@@ -484,7 +536,9 @@ async def recevoir_sms(request: Request):
             print(f"✅ minimal ID:{id2}")
             if parsed.get("amount") and parsed.get("account_id"):
                 maj_current_cash(parsed["account_id"], parsed["amount"],
-                                 parsed["raison"], solde_avant, parsed.get("solde"))
+                                 parsed["raison"], solde_avant,
+                                 parsed.get("solde"),
+                                 statut_transaction=p_min["statut"])
             return {"status": "ok_minimal", "id": id2}
         except Exception as e2:
             print(f"❌ Erreur finale : {e2}")
@@ -502,15 +556,22 @@ def test_sms(sms: SMS):
     id_t = res.data[0].get("id","?") if res.data else "?"
     if parsed.get("amount") and parsed.get("account_id"):
         maj_current_cash(parsed["account_id"], parsed["amount"],
-                         parsed["raison"], None, parsed.get("solde"))
-    print(f"✅ TEST ID:{id_t} | source={parsed.get('source_analyse','?')}")
-    return {"status": "test_ok", "id": id_t, "parsed": parsed,
-            "source_analyse": parsed.get("source_analyse","?")}
+                         parsed["raison"], None, parsed.get("solde"),
+                         statut_transaction=parsed.get("statut","confirmed"))
+    print(f"✅ TEST ID:{id_t} | source={parsed.get('source_analyse','?')} "
+          f"| statut={parsed.get('statut','?')}")
+    return {
+        "status":         "test_ok",
+        "id":             id_t,
+        "parsed":         parsed,
+        "source_analyse": parsed.get("source_analyse","?"),
+        "statut_tx":      parsed.get("statut","?"),
+    }
 
 
 @app.post("/sms/test-ia")
 async def test_ia_seul(request: Request):
-    """Teste l'analyse sans insérer en base. Utile pour vérifier la clé API."""
+    """Teste l'analyse sans insérer en base."""
     try:
         body = await request.json()
     except:
@@ -523,12 +584,86 @@ async def test_ia_seul(request: Request):
     resultat_ia = analyser_sms_ia(msg)
     classique   = parser_sms_classique(msg, "")
 
+    confiance = resultat_ia.get("confiance", 0) if resultat_ia else 0.0
     return {
-        "ia":             resultat_ia,
-        "classique":      classique,
-        "source_utilisee": "ia" if (
-            resultat_ia and
-            resultat_ia.get("confiance", 0) >= CLAUDE_SEUIL_CONFIANCE
-        ) else "classique",
-        "ia_configuree":  bool(CLAUDE_API_KEY),
+        "ia":              resultat_ia,
+        "classique":       classique,
+        "source_utilisee": "ia" if (resultat_ia and confiance >= CLAUDE_SEUIL_CONFIANCE)
+                           else "classique",
+        "statut_prevu":    "confirmed" if (resultat_ia and confiance >= CLAUDE_SEUIL_CONFIANCE)
+                           else ("pending" if resultat_ia else "confirmed"),
+        "ia_configuree":   bool(CLAUDE_API_KEY),
     }
+
+
+# ── Route pour confirmer une transaction pending depuis Graham POS ──
+@app.post("/transactions/{tx_id}/confirmer")
+async def confirmer_transaction(tx_id: int, request: Request):
+    """
+    Appelé par Graham POS quand le caissier confirme une transaction pending.
+    Body : {"raison": "momo_depot"} (la raison corrigée par le caissier)
+    """
+    try:
+        body = await request.json()
+    except:
+        body = {}
+
+    nouvelle_raison = body.get("raison", "")
+
+    try:
+        # Récupérer la transaction
+        res_tx = supabase.table("transactions").select("*").eq("id", tx_id).execute()
+        if not res_tx.data:
+            return {"error": f"Transaction {tx_id} introuvable"}
+
+        tx = res_tx.data[0]
+        raison_finale = nouvelle_raison or tx.get("raison", "momo_transaction")
+
+        # Mettre à jour statut + raison
+        supabase.table("transactions").update({
+            "statut": "confirmed",
+            "raison": raison_finale,
+        }).eq("id", tx_id).execute()
+
+        # Maintenant mettre à jour le cash physique
+        account_id = tx.get("account_id")
+        amount     = tx.get("amount") or 0
+        solde      = tx.get("solde")
+
+        if amount and account_id:
+            # Récupérer solde avant
+            try:
+                res_prev = supabase.table("transactions") \
+                                   .select("solde") \
+                                   .eq("account_id", account_id) \
+                                   .not_.is_("solde", "null") \
+                                   .neq("id", tx_id) \
+                                   .order("created_at", desc=True) \
+                                   .limit(1).execute()
+                solde_avant = int(res_prev.data[0]["solde"]) if res_prev.data else None
+            except:
+                solde_avant = None
+
+            maj_current_cash(account_id, amount, raison_finale,
+                             solde_avant, solde, statut_transaction="confirmed")
+
+        print(f"✅ Transaction {tx_id} confirmée → raison={raison_finale}")
+        return {"status": "ok", "tx_id": tx_id, "raison": raison_finale}
+
+    except Exception as e:
+        print(f"❌ Erreur confirmation {tx_id} : {e}")
+        return {"status": "error", "detail": str(e)}
+
+
+# ── Route pour ignorer une transaction pending ──────────────────────
+@app.post("/transactions/{tx_id}/ignorer")
+async def ignorer_transaction(tx_id: int):
+    """Marque une transaction pending comme ignorée (cash non touché)."""
+    try:
+        supabase.table("transactions").update({
+            "statut": "ignored"
+        }).eq("id", tx_id).execute()
+        print(f"✅ Transaction {tx_id} ignorée")
+        return {"status": "ok", "tx_id": tx_id}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
