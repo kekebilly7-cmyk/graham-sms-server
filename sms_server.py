@@ -391,61 +391,74 @@ def health_check():
 def activer_tracker(payload: ActivationRequest):
     """
     Associe un téléphone Android à un compte Mobile Money System.
-
-    L'app Android envoie le code à 8 chiffres visible dans les Paramètres
-    du logiciel Mobile Money System PC. On vérifie ce code dans mm_profiles,
-    on génère un token unique pour ce téléphone, et on crée l'entrée dans
-    tracker_devices. Ce token sera utilisé pour authentifier tous les SMS
-    envoyés par ce téléphone.
+    Utilise supabase_admin (service_role) pour bypass le RLS de mm_profiles.
     """
     code = payload.merchant_code.strip()
+    logger.info(f"🔍 Tentative d'activation — code reçu: '{code}' device: {payload.device_id[:8]}...")
 
     if len(code) != 8 or not code.isdigit():
+        logger.warning(f"❌ Code invalide: '{code}'")
         return {"status": "error", "message": "Code invalide — 8 chiffres requis"}
 
-    # Chercher le commerçant propriétaire de ce code
-    # UTILISE supabase_admin (service_role) car mm_profiles est protégé par RLS
-    # et le serveur n'est pas un utilisateur authentifié Supabase Auth
+    # Chercher le commerçant — supabase_admin bypass le RLS
     try:
         res = supabase_admin.table("mm_profiles") \
-                            .select("id, nom_complet, nom_entreprise") \
+                            .select("id, nom_complet, nom_entreprise, merchant_code") \
                             .eq("merchant_code", code) \
                             .execute()
+        logger.info(f"🔍 Lookup mm_profiles: {len(res.data)} résultat(s) pour code '{code}'")
     except Exception as e:
-        logger.error(f"Erreur lookup merchant_code: {e}")
+        logger.error(f"❌ Erreur lookup mm_profiles: {e}")
         return {"status": "error", "message": f"Erreur serveur : {str(e)}"}
 
     if not res.data:
+        # Debug : lister tous les codes existants pour comparaison
+        try:
+            all_codes = supabase_admin.table("mm_profiles") \
+                                       .select("merchant_code") \
+                                       .execute()
+            codes_existants = [r.get("merchant_code") for r in all_codes.data if r.get("merchant_code")]
+            logger.warning(f"⚠ Code '{code}' non trouvé. Codes existants: {codes_existants}")
+        except Exception:
+            logger.warning(f"⚠ Code '{code}' non trouvé. Impossible de lister les codes.")
         return {"status": "error", "message": "Code incorrect ou inexistant"}
 
-    profil     = res.data[0]
-    user_uuid  = profil["id"]
-    user_name  = (profil.get("nom_complet")
-                  or profil.get("nom_entreprise")
-                  or "Commerçant")
+    profil    = res.data[0]
+    user_uuid = profil["id"]
+    user_name = (profil.get("nom_complet")
+                 or profil.get("nom_entreprise")
+                 or "Commerçant")
 
-    # Générer un token sécurisé unique pour ce téléphone
     api_token = secrets.token_hex(32)
 
-    # Enregistrer l'appareil — supabase_admin car tracker_devices aussi protégé
-    try:
-        supabase_admin.table("tracker_devices").upsert({
-            "device_id":          payload.device_id,
-            "user_uuid":          user_uuid,
-            "device_name":        payload.device_name,
-            "api_token":          api_token,
-            "role":               "CAPTEUR",
-            "is_active":          True,
-            "association_active": True,
-            "sim_a_label":        payload.sim_a_label,
-            "sim_b_label":        payload.sim_b_label,
-            "last_seen_at":       datetime.datetime.utcnow().isoformat(),
-        }, on_conflict="device_id").execute()
-    except Exception as e:
-        logger.error(f"Erreur enregistrement device: {e}")
-        return {"status": "error", "message": f"Impossible d'enregistrer l'appareil : {str(e)}"}
+    # Enregistrer l'appareil — sans association_active (colonne optionnelle)
+    device_data = {
+        "device_id":   payload.device_id,
+        "user_uuid":   user_uuid,
+        "device_name": payload.device_name,
+        "api_token":   api_token,
+        "role":        "CAPTEUR",
+        "is_active":   True,
+        "sim_a_label": payload.sim_a_label,
+        "sim_b_label": payload.sim_b_label,
+        "last_seen_at": datetime.datetime.utcnow().isoformat(),
+    }
 
-    logger.info(f"✅ Activation: device={payload.device_id[:8]}... user={user_name}")
+    try:
+        supabase_admin.table("tracker_devices") \
+                      .upsert(device_data, on_conflict="device_id") \
+                      .execute()
+        logger.info(f"✅ Appareil enregistré: {payload.device_id[:8]}... user={user_name}")
+    except Exception as e:
+        logger.error(f"❌ Erreur upsert tracker_devices: {e}")
+        # Tentative insert simple en fallback
+        try:
+            supabase_admin.table("tracker_devices").insert(device_data).execute()
+            logger.info(f"✅ Appareil inséré (fallback insert): {payload.device_id[:8]}...")
+        except Exception as e2:
+            logger.error(f"❌ Erreur insert fallback: {e2}")
+            return {"status": "error", "message": f"Impossible d'enregistrer l'appareil : {str(e2)}"}
+
     return {
         "status":     "success",
         "api_token":  api_token,
