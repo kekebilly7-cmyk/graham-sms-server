@@ -41,14 +41,25 @@ from supabase import create_client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+SUPABASE_URL         = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY         = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 
-SEUIL_CONFIANCE_IA = 0.75   # En dessous → pending (confirmation manuelle)
+SEUIL_CONFIANCE_IA  = 0.75
 IA_TIMEOUT_SECONDES = 8
 
+# Client normal (respecte RLS) — pour les opérations utilisateur
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Client admin (bypass RLS) — UNIQUEMENT pour :
+#   1. Vérifier merchant_code lors de l'activation
+#   2. Créer/mettre à jour tracker_devices
+# Ne jamais utiliser pour lire des données personnelles des commerçants
+supabase_admin = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
+)
 
 # Client Claude Haiku (IA principale)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -119,7 +130,7 @@ def verifier_token_tracker(authorization: str) -> dict:
     token = authorization.replace("Bearer ", "").strip()
 
     try:
-        res = supabase.table("tracker_devices") \
+        res = supabase_admin.table("tracker_devices") \
                       .select("device_id, user_uuid, is_active, device_name") \
                       .eq("api_token", token) \
                       .execute()
@@ -136,7 +147,7 @@ def verifier_token_tracker(authorization: str) -> dict:
 
     # Mettre à jour last_seen_at en arrière-plan (best-effort)
     try:
-        supabase.table("tracker_devices") \
+        supabase_admin.table("tracker_devices") \
                 .update({"last_seen_at": datetime.datetime.utcnow().isoformat()}) \
                 .eq("api_token", token) \
                 .execute()
@@ -393,11 +404,13 @@ def activer_tracker(payload: ActivationRequest):
         return {"status": "error", "message": "Code invalide — 8 chiffres requis"}
 
     # Chercher le commerçant propriétaire de ce code
+    # UTILISE supabase_admin (service_role) car mm_profiles est protégé par RLS
+    # et le serveur n'est pas un utilisateur authentifié Supabase Auth
     try:
-        res = supabase.table("mm_profiles") \
-                      .select("id, nom_complet, nom_entreprise") \
-                      .eq("merchant_code", code) \
-                      .execute()
+        res = supabase_admin.table("mm_profiles") \
+                            .select("id, nom_complet, nom_entreprise") \
+                            .eq("merchant_code", code) \
+                            .execute()
     except Exception as e:
         logger.error(f"Erreur lookup merchant_code: {e}")
         return {"status": "error", "message": f"Erreur serveur : {str(e)}"}
@@ -414,9 +427,9 @@ def activer_tracker(payload: ActivationRequest):
     # Générer un token sécurisé unique pour ce téléphone
     api_token = secrets.token_hex(32)
 
-    # Enregistrer l'appareil
+    # Enregistrer l'appareil — supabase_admin car tracker_devices aussi protégé
     try:
-        supabase.table("tracker_devices").upsert({
+        supabase_admin.table("tracker_devices").upsert({
             "device_id":          payload.device_id,
             "user_uuid":          user_uuid,
             "device_name":        payload.device_name,
@@ -458,7 +471,7 @@ def dissocier_tracker(
 
     # Vérifier que ce token correspond bien à ce device
     try:
-        res = supabase.table("tracker_devices") \
+        res = supabase_admin.table("tracker_devices") \
                       .select("device_id") \
                       .eq("device_id", device_id) \
                       .eq("api_token", token) \
@@ -471,7 +484,7 @@ def dissocier_tracker(
 
     # Invalider l'association
     try:
-        supabase.table("tracker_devices").update({
+        supabase_admin.table("tracker_devices").update({
             "is_active":          False,
             "association_active": False,
             "api_token":          None,
