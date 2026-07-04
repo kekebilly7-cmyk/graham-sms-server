@@ -614,31 +614,45 @@ def recevoir_sms(
     account_id  = account_map.get(operateur.upper(), 1)
 
     # ── Insertion en base ─────────────────────────────────────────
+    # On tente avec tous les champs d'abord, puis fallback minimal si erreur
+    insert_data = {
+        "account_id":   account_id,
+        "raison":       raison,
+        "amount":       amount,
+        "phone_number": phone or None,
+        "nom_destinataire": nom_dest or None,
+        "reference_id": reference or None,
+        "solde":        solde if solde > 0 else None,
+        "frais":        frais,
+        "statut":       statut,
+        "raw_message":  payload.body,
+        "sender":       payload.sender,
+    }
+
+    # Champs étendus (ajoutés progressivement — best effort)
+    optional_fields = {
+        "confiance_ia":   confiance,
+        "source_parsing": source,
+        "device_id":      device_id,
+        "user_uuid":      user_uuid,
+        "sim_label":      payload.sim_label or None,
+        "sim_slot":       payload.sim_slot if payload.sim_slot != -1 else None,
+        "direction":      payload.direction or "IN",
+        "sms_timestamp":  payload.timestamp or None,
+    }
+
     try:
-        res_ins = supabase.table("transactions").insert({
-            "account_id":       account_id,
-            "user_uuid":        user_uuid,
-            "device_id":        device_id,
-            "raison":           raison,
-            "amount":           amount,
-            "phone_number":     phone,
-            "nom_destinataire": nom_dest,
-            "reference_id":     reference,
-            "solde":            solde if solde > 0 else None,
-            "frais":            frais,
-            "statut":           statut,
-            "confiance_ia":     confiance,
-            "source_parsing":   source,
-            "raw_message":      payload.body,
-            "sender":           payload.sender,
-            "sim_label":        payload.sim_label,
-            "sim_slot":         payload.sim_slot,
-            "direction":        payload.direction,
-            "sms_timestamp":    payload.timestamp,
-        }).execute()
+        res_ins = supabase.table("transactions").insert(
+            {**insert_data, **optional_fields}
+        ).execute()
     except Exception as e:
-        logger.error(f"Erreur insertion transaction: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning(f"Insert complet échoué ({e}) — tentative minimale")
+        # Fallback : insert avec seulement les colonnes de base
+        try:
+            res_ins = supabase.table("transactions").insert(insert_data).execute()
+        except Exception as e2:
+            logger.error(f"Erreur insertion transaction (minimal): {e2}")
+            raise HTTPException(status_code=500, detail=str(e2))
 
     tx_id = res_ins.data[0]["id"] if res_ins.data else None
     logger.info(f"✅ Transaction: {operateur} {amount}F statut={statut} source={source} device={device_id[:8]}...")
