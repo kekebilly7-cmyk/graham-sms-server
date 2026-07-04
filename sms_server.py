@@ -256,11 +256,8 @@ Ne réponds qu'avec le JSON, aucun texte autour."""
 
 def parser_sms_regex(body: str, sender: str) -> dict:
     """
-    Fallback regex pour parser un SMS Mobile Money béninois.
-    Toujours disponible, confiance fixe à 0.85 si trouvé.
-
-    Supporte MTN MoMo, Moov Money (Flooz), Celtiis Cash.
-    Format montant : "5000F", "5 000 XOF", "5,000 FCFA", "1312F"
+    Fallback regex amélioré pour SMS Mobile Money béninois.
+    Supporte : 1312F, 5000F, 5 000 XOF, 5,000 FCFA, 5.000F
     """
     texte = body.lower()
     result = {
@@ -274,76 +271,90 @@ def parser_sms_regex(body: str, sender: str) -> dict:
         "confiance":        0.85
     }
 
-    # ── Détection du type de transaction ──────────────────────────
-    if any(k in texte for k in ["reçu", "recu", "depot", "dépôt", "received", "credite", "crédité"]):
+    # ── Type de transaction ────────────────────────────────────────
+    if any(k in texte for k in ["reçu", "recu", "vous avez reçu", "received",
+                                  "credite", "crédité", "depot recu", "cash in"]):
         result["raison"] = "momo_depot"
-    elif any(k in texte for k in ["retrait", "withdrawn", "retire", "retiré"]):
+    elif any(k in texte for k in ["retrait", "withdrawn", "cash out"]):
         result["raison"] = "momo_retrait"
-    elif any(k in texte for k in ["transfert", "transfer", "envoyé", "envoye", "sent"]):
+    elif any(k in texte for k in ["transfert", "transfer", "vous avez envoyé",
+                                   "envoyé", "envoye", "sent to"]):
         result["raison"] = "momo_transfert"
-    elif any(k in texte for k in ["paiement", "payment", "payé", "paye", "achat"]):
+    elif any(k in texte for k in ["paiement", "payment", "payé", "paye"]):
         result["raison"] = "momo_paiement"
     else:
-        result["confiance"] = 0.60  # Ambigu → pending
+        result["confiance"] = 0.60
 
-    # ── Montant ───────────────────────────────────────────────────
-    # Supporte : 1312F, 5000 XOF, 5,000 FCFA, 5 000F, 1.312 F
+    # ── Montant — supporte 1312F, 5 000 XOF, 5,000 FCFA, 5.000F ──
+    # Ordre : chercher d'abord le montant principal (dépôt/transfert)
+    # puis n'importe quel montant
     patterns_montant = [
-        r'(\d[\d\s,.]*)\s*(?:xof|fcfa|cfa)\b',
-        r'(\d[\d\s,.]*)\s*f\b',
-        r'montant\s*:?\s*(\d[\d\s,.]*)',
+        # "transfert 1312F" ou "dépôt 5000 XOF"
+        r'(?:transfert|depot|dépôt|reçu|recu|paiement|retrait|envoy[eé])\s+(?:de\s+)?(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|cfa|f\b)',
+        # "1312F de" ou "5 000F"
+        r'\b(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|cfa|f)\b',
+        # Montant après "montant :"
+        r'montant\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)',
     ]
     for pat in patterns_montant:
-        m = re.search(pat, texte, re.IGNORECASE)
+        m = re.search(pat, body, re.IGNORECASE)
         if m:
-            raw = re.sub(r'[\s,.\']', '', m.group(1))
+            raw = re.sub(r'[\s,.]', '', m.group(1))
             try:
-                result["amount"] = int(raw)
-                break
+                val = int(raw)
+                if val > 0:
+                    result["amount"] = val
+                    break
             except ValueError:
                 pass
 
     # ── Solde ─────────────────────────────────────────────────────
     m_solde = re.search(
-        r'(?:solde|balance|nouveau solde)\s*:?\s*(\d[\d\s,.]*)\s*(?:xof|fcfa|f\b)?',
-        texte, re.IGNORECASE
+        r'(?:solde|balance|nouveau solde)\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|f\b)?',
+        body, re.IGNORECASE
     )
     if m_solde:
-        raw = re.sub(r'[\s,.\']', '', m_solde.group(1))
+        raw = re.sub(r'[\s,.]', '', m_solde.group(1))
         try:
             result["solde"] = int(raw)
         except ValueError:
             pass
 
     # ── Numéro de téléphone ───────────────────────────────────────
-    m_phone = re.search(
-        r'(?:de|à|from|to|vers|destinataire)?\s*[+]?(?:229)?\s*([679]\d[\s]?\d{2}[\s]?\d{2}[\s]?\d{2})',
-        body
-    )
+    m_phone = re.search(r'\b((?:00229|229)?[679]\d{7})\b', body)
     if m_phone:
-        result["phone"] = re.sub(r'\s', '', m_phone.group(1))
+        result["phone"] = m_phone.group(1)
 
-    # ── Référence transaction ─────────────────────────────────────
-    m_ref = re.search(
-        r'(?:txid|ref[:\s#]|id[:\s#]|reference[:\s#])\s*([A-Z0-9\-]{4,20})',
+    # ── Référence transaction — chercher un vrai ID numérique ─────
+    # Priorité aux IDs numériques longs (vrais IDs opérateurs)
+    m_id = re.search(
+        r'(?:id\s*:?\s*|ref\s*:?\s*|id:\s*)(\d{6,20})',
         body, re.IGNORECASE
     )
-    if m_ref:
-        result["reference_id"] = m_ref.group(1)
+    if m_id:
+        result["reference_id"] = m_id.group(1)
+    else:
+        # Fallback : chercher un code alphanumérique qui n'est pas un nom de société
+        m_ref = re.search(
+            r'(?:ref[eé]rence?\s*:?\s*|txid\s*:?\s*)([A-Z0-9]{6,20})\b',
+            body, re.IGNORECASE
+        )
+        if m_ref:
+            result["reference_id"] = m_ref.group(1)
 
     # ── Frais ─────────────────────────────────────────────────────
     m_frais = re.search(
-        r'(?:frais|fees|commission)\s*:?\s*(\d[\d\s,.]*)\s*(?:xof|fcfa|f\b)?',
-        texte, re.IGNORECASE
+        r'(?:frais|fees)\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|f\b)?',
+        body, re.IGNORECASE
     )
     if m_frais:
-        raw = re.sub(r'[\s,.\']', '', m_frais.group(1))
+        raw = re.sub(r'[\s,.]', '', m_frais.group(1))
         try:
             result["frais"] = int(raw)
         except ValueError:
             pass
 
-    logger.info(f"📋 Regex parsed: raison={result['raison']} amount={result['amount']}")
+    logger.info(f"📋 Regex: raison={result['raison']} amount={result['amount']} solde={result['solde']}")
     return result
 
 
@@ -581,18 +592,26 @@ def recevoir_sms(
     except Exception:
         pass
 
-    # ── Déduplication ─────────────────────────────────────────────
-    if payload.transaction_id:
-        try:
-            existing = supabase.table("transactions") \
-                               .select("id") \
-                               .eq("reference_id", payload.transaction_id) \
-                               .eq("device_id",    device_id) \
-                               .execute()
-            if existing.data:
-                return {"status": "duplicate", "id": existing.data[0]["id"]}
-        except Exception:
-            pass
+    # ── Déduplication robuste ─────────────────────────────────────
+    # On utilise un hash du corps du SMS + device_id pour éviter les doublons
+    # même quand reference_id est absent ou identique (nom de société)
+    import hashlib
+    sms_hash = hashlib.md5(
+        f"{device_id}|{payload.body[:100]}".encode()
+    ).hexdigest()
+
+    try:
+        existing = supabase.table("transactions") \
+                           .select("id") \
+                           .eq("device_id", device_id) \
+                           .eq("sms_hash",  sms_hash) \
+                           .execute()
+        if existing.data:
+            logger.info(f"Doublon détecté (hash={sms_hash[:8]}) — ignoré")
+            return {"status": "duplicate", "id": existing.data[0]["id"]}
+    except Exception:
+        # Colonne sms_hash peut ne pas exister encore → continuer sans déduplication
+        pass
 
     # ── Parsing IA + fallback regex ───────────────────────────────
     parsed, source = parser_sms(payload.body, payload.sender)
@@ -627,6 +646,7 @@ def recevoir_sms(
         "statut":       statut,
         "raw_message":  payload.body,
         "sender":       payload.sender,
+        "sms_hash":     sms_hash,  # pour la déduplication
     }
 
     # Champs étendus (ajoutés progressivement — best effort)
