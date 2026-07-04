@@ -674,12 +674,55 @@ def recevoir_sms(
             logger.error(f"Erreur insertion transaction (minimal): {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
 
-    tx_id = res_ins.data[0]["id"] if res_ins.data else None
-    logger.info(f"✅ Transaction: {operateur} {amount}F statut={statut} source={source} device={device_id[:8]}...")
+    # ── Extraction nom destinataire améliorée ─────────────────────
+    # Le regex de base peut manquer le nom dans certains formats MTN/Moov
+    if not nom_dest:
+        # Format : "a NOM PRENOM (229XXXXXXX)"
+        m_nom = re.search(
+            r'\ba\s+([A-ZÀ-Ça-zà-ç][A-ZÀ-Ça-zà-ç\s\-\.]{2,40}?)\s*[\(\d]',
+            payload.body
+        )
+        if m_nom:
+            nom_dest = m_nom.group(1).strip()
+        else:
+            # Format : "de NOM PRENOM"
+            m_nom2 = re.search(
+                r'\bde\s+([A-ZÀ-Ça-zà-ç][A-ZÀ-Ça-zà-ç\s\-\.]{2,40}?)'
+                r'\s*(?:\(|\.|,|Réf|ID|\d)',
+                payload.body
+            )
+            if m_nom2:
+                excl = {"mtn","momo","moov","fcfa","vous","avez","votre","compte"}
+                n = m_nom2.group(1).strip()
+                if n.lower() not in excl and len(n) > 2:
+                    nom_dest = n
+
+    # ── Extraction numéro améliorée ───────────────────────────────
+    if not phone:
+        m_ph = re.search(r'\b((?:00229|229)[679]\d{7})\b', payload.body)
+        if m_ph:
+            phone = m_ph.group(1)
+        else:
+            m_ph2 = re.search(r'\b([679]\d{7})\b', payload.body)
+            if m_ph2:
+                phone = m_ph2.group(1)
+
+    tx_id_str = str(res_ins.data[0]["id"]) if res_ins.data else ""
+    logger.info(f"✅ Transaction: {operateur} {amount}F raison={raison} "
+                f"statut={statut} source={source} device={device_id[:8]}...")
+
+    # ── Mise à jour cash physique ─────────────────────────────────
+    if amount > 0 and statut == "confirmed":
+        try:
+            maj_current_cash(account_id, amount, raison,
+                             statut_transaction=statut,
+                             transaction_id=tx_id_str)
+        except Exception as e_cash:
+            logger.error(f"Erreur cash update: {e_cash}")
 
     return {
         "status":   "success",
-        "id":       tx_id,
+        "id":       tx_id_str,
         "statut":   statut,
         "raison":   raison,
         "amount":   amount,
@@ -801,6 +844,102 @@ def lister_pending(account_id: int = 0):
 # ════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES INTERNES
 # ════════════════════════════════════════════════════════════════════════════
+
+def reseau_est_actif(account_id: int) -> bool:
+    """Vérifie si le réseau est ON dans cash_sessions."""
+    from datetime import datetime, timezone, timedelta
+    paris     = timezone(timedelta(hours=2))
+    now_paris = datetime.now(paris)
+    debut_utc = now_paris.replace(hour=0, minute=0, second=0, microsecond=0) \
+                         .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        res = supabase.table("cash_sessions").select("actif") \
+                      .eq("account_id", account_id) \
+                      .gte("created_at", debut_utc) \
+                      .gt("opening_cash", 0) \
+                      .order("created_at", desc=False) \
+                      .limit(1).execute()
+        if res.data:
+            val = res.data[0].get("actif", True)
+            if val is False:
+                return False
+        return True
+    except Exception as e:
+        logger.error(f"reseau_est_actif error: {e}")
+        return True
+
+
+def maj_current_cash(account_id: int, amount: int, raison: str,
+                     statut_transaction: str = "confirmed",
+                     transaction_id: str = ""):
+    """
+    Met à jour le cash physique selon la logique Graham POS.
+
+    Règle métier :
+    - momo_depot : commerçant reçoit mobile money → donne cash → cash DIMINUE
+    - momo_retrait/transfert/paiement : commerçant reçoit cash → envoie mobile → cash AUGMENTE
+    """
+    if statut_transaction == "pending":
+        return
+
+    if not reseau_est_actif(account_id):
+        logger.info(f"⏭ Réseau {account_id} OFF")
+        return
+
+    if raison == "momo_depot":
+        delta   = -amount        # cash physique diminue
+        type_mv = "momo_depot_cash"
+    elif raison in ("momo_retrait", "momo_transfert", "momo_paiement", "momo_envoi"):
+        delta   = +amount        # cash physique augmente
+        type_mv = "momo_retrait_cash"
+    else:
+        return
+
+    from datetime import datetime, timezone, timedelta
+    paris     = timezone(timedelta(hours=2))
+    now_paris = datetime.now(paris)
+    debut_utc = now_paris.replace(hour=0, minute=0, second=0, microsecond=0) \
+                         .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        res = supabase.table("cash_sessions").select("*") \
+                      .eq("account_id", account_id) \
+                      .gte("created_at", debut_utc) \
+                      .gt("opening_cash", 0) \
+                      .order("created_at", desc=False) \
+                      .limit(1).execute()
+        if not res.data:
+            logger.info(f"⏭ Aucune session cash (account_id={account_id})")
+            return
+
+        sess    = res.data[0]
+        opening = float(sess.get("opening_cash") or 0)
+        if opening <= 0:
+            return
+
+        _cc     = sess.get("current_cash")
+        current = float(_cc) if _cc is not None else opening
+        if current <= 0 and delta < 0:
+            logger.info(f"⏭ Cash épuisé")
+            return
+
+        nouveau = max(0, current + delta)
+
+        supabase.table("cash_sessions") \
+                .update({"current_cash": nouveau}) \
+                .eq("id", sess["id"]).execute()
+
+        mv = {"account_id": account_id, "amount": delta,
+              "type": type_mv, "cash_apres": nouveau}
+        if transaction_id:
+            mv["transaction_id"] = transaction_id
+        supabase.table("cash_movements").insert(mv).execute()
+
+        sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
+        logger.info(f"💵 Cash {sens} F | {current:.0f}→{nouveau:.0f} F | {raison}")
+
+    except Exception as e:
+        logger.error(f"Erreur maj_current_cash: {e}")
+
 
 def _detecter_operateur(sender: str, body: str) -> str:
     """Détecte l'opérateur Mobile Money depuis l'expéditeur et le corps du SMS."""
