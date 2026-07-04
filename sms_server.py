@@ -30,6 +30,7 @@ from typing import Optional
 
 import anthropic
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
@@ -517,83 +518,113 @@ def dissocier_tracker(
 @app.post("/api/transactions/sms", status_code=201)
 def recevoir_sms(
     payload: SmsPayload,
-    authorization: Optional[str] = Header(None)
+    x_device_id: Optional[str] = Header(None),
+    x_app_key:   Optional[str] = Header(None),
 ):
     """
-    Reçoit un SMS Mobile Money capturé par l'app Android Tracker.
+    Reçoit un SMS depuis l'app Android Tracker.
 
-    Authentification : token Bearer généré lors de l'activation.
-    Le token identifie l'appareil et le commerçant (user_uuid).
+    Logique intelligente :
+    - L'app envoie TOUJOURS ses SMS, sans vérifier l'association
+    - Le serveur vérifie si ce device_id est enregistré dans tracker_devices
+    - Device connu + actif → traite la transaction pour ce commerçant
+    - Device inconnu → ignore silencieusement (202), pas d'erreur
 
-    Parsing : IA Claude Haiku en premier, fallback regex si échec.
-    Confiance < 75% → statut "pending" (alerte rouge dans Graham POS).
+    Cette approche permet à l'app de capturer immédiatement sans configuration,
+    et d'envoyer au serveur dès le premier lancement.
     """
 
-    # ── Authentification ──────────────────────────────────────────
-    device_info = verifier_token_tracker(authorization)
-    user_uuid   = device_info.get("user_uuid")
+    # Vérification clé d'application minimale (anti-spam)
+    APP_KEY = os.environ.get("TRACKER_APP_KEY", "GRAHAM_TRACKER_2025")
+    if x_app_key and x_app_key != APP_KEY:
+        raise HTTPException(status_code=401, detail="Clé application invalide")
 
-    if not user_uuid:
-        raise HTTPException(
-            status_code=403,
-            detail="Appareil non associé à un compte"
-        )
+    device_id = x_device_id or payload.device_id
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id manquant")
+
+    # ── Vérifier si ce device est enregistré et associé ───────────
+    try:
+        res = supabase_admin.table("tracker_devices") \
+                            .select("user_uuid, is_active, sim_a_label, sim_b_label") \
+                            .eq("device_id", device_id) \
+                            .execute()
+    except Exception as e:
+        logger.error(f"Erreur lookup tracker_devices: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not res.data:
+        # Device inconnu — ignorer silencieusement
+        logger.info(f"📵 Device inconnu {device_id[:8]}... — SMS ignoré (pas encore associé)")
+        return JSONResponse(status_code=202, content={
+            "status":  "ignored",
+            "reason":  "device_not_registered",
+            "message": "Device non enregistré — associez d'abord via Mobile Money System"
+        })
+
+    device    = res.data[0]
+    user_uuid = device.get("user_uuid")
+
+    if not device.get("is_active", False) or not user_uuid:
+        logger.info(f"📵 Device {device_id[:8]}... inactif ou non associé — ignoré")
+        return JSONResponse(status_code=202, content={
+            "status":  "ignored",
+            "reason":  "device_inactive",
+            "message": "Device inactif ou non associé à un compte"
+        })
+
+    # ── Mettre à jour last_seen_at ─────────────────────────────────
+    try:
+        supabase_admin.table("tracker_devices") \
+                      .update({"last_seen_at": datetime.datetime.utcnow().isoformat()}) \
+                      .eq("device_id", device_id).execute()
+    except Exception:
+        pass
 
     # ── Déduplication ─────────────────────────────────────────────
     if payload.transaction_id:
         try:
             existing = supabase.table("transactions") \
                                .select("id") \
-                               .eq("reference_id",  payload.transaction_id) \
-                               .eq("device_id",     payload.device_id) \
+                               .eq("reference_id", payload.transaction_id) \
+                               .eq("device_id",    device_id) \
                                .execute()
             if existing.data:
-                return {
-                    "status":  "duplicate",
-                    "id":      existing.data[0]["id"],
-                    "message": "Transaction déjà reçue"
-                }
+                return {"status": "duplicate", "id": existing.data[0]["id"]}
         except Exception:
             pass
 
     # ── Parsing IA + fallback regex ───────────────────────────────
     parsed, source = parser_sms(payload.body, payload.sender)
 
-    confiance   = float(parsed.get("confiance", 0.85))
-    raison      = parsed.get("raison",           "momo_depot")
-    amount      = int(parsed.get("amount",       payload.amount or 0))
-    phone       = parsed.get("phone",            payload.phone  or "")
-    nom_dest    = parsed.get("nom_destinataire", "")
-    reference   = parsed.get("reference_id",     payload.transaction_id or "")
-    solde       = int(parsed.get("solde",        0))
-    frais       = int(parsed.get("frais",        0))
+    confiance = float(parsed.get("confiance", 0.85))
+    raison    = parsed.get("raison",           "momo_depot")
+    amount    = int(parsed.get("amount",       payload.amount or 0))
+    phone     = parsed.get("phone",            payload.phone  or "")
+    nom_dest  = parsed.get("nom_destinataire", "")
+    reference = parsed.get("reference_id",     payload.transaction_id or "")
+    solde     = int(parsed.get("solde",        0))
+    frais     = int(parsed.get("frais",        0))
 
-    # Statut selon confiance IA
-    if source == "ia" and confiance < SEUIL_CONFIANCE_IA:
-        statut = "pending"
-        logger.warning(
-            f"⚠ Transaction pending — confiance IA trop basse: {confiance:.0%}"
-        )
-    else:
-        statut = "confirmed"
+    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
+             else "confirmed"
 
-    # Déterminer account_id selon l'opérateur
-    operateur   = payload.operator or _detecter_operateur(payload.sender, payload.body)
+    operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
     account_id  = account_map.get(operateur.upper(), 1)
 
     # ── Insertion en base ─────────────────────────────────────────
     try:
-        res = supabase.table("transactions").insert({
+        res_ins = supabase.table("transactions").insert({
             "account_id":       account_id,
             "user_uuid":        user_uuid,
-            "device_id":        payload.device_id,
+            "device_id":        device_id,
             "raison":           raison,
             "amount":           amount,
             "phone_number":     phone,
             "nom_destinataire": nom_dest,
             "reference_id":     reference,
-            "solde":            solde,
+            "solde":            solde if solde > 0 else None,
             "frais":            frais,
             "statut":           statut,
             "confiance_ia":     confiance,
@@ -609,22 +640,17 @@ def recevoir_sms(
         logger.error(f"Erreur insertion transaction: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    tx_id = res.data[0]["id"] if res.data else None
-
-    logger.info(
-        f"📱 SMS reçu: {operateur} {amount}F "
-        f"statut={statut} source={source} confiance={confiance:.0%}"
-    )
+    tx_id = res_ins.data[0]["id"] if res_ins.data else None
+    logger.info(f"✅ Transaction: {operateur} {amount}F statut={statut} source={source} device={device_id[:8]}...")
 
     return {
-        "status":       "success",
-        "id":           tx_id,
-        "statut":       statut,
-        "raison":       raison,
-        "amount":       amount,
-        "confiance_ia": confiance,
-        "source":       source,
-        "message":      "Transaction enregistrée"
+        "status":   "success",
+        "id":       tx_id,
+        "statut":   statut,
+        "raison":   raison,
+        "amount":   amount,
+        "source":   source,
+        "message":  "Transaction enregistrée"
     }
 
 
