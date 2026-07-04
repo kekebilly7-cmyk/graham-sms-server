@@ -681,7 +681,45 @@ def confirmer_transaction(
 # LISTE DES TRANSACTIONS PENDING — pour Graham POS
 # ────────────────────────────────────────────────────────────────────────────
 
-@app.get("/transactions/pending")
+@app.get("/api/debug/code/{code}")
+def debug_code(code: str):
+    """
+    Endpoint de diagnostic — vérifie si un code existe dans mm_profiles.
+    À utiliser depuis le navigateur pour diagnostiquer les problèmes d'association.
+    Exemple : https://graham-sms-server.onrender.com/api/debug/code/12345678
+    """
+    try:
+        res = supabase_admin.table("mm_profiles") \
+                            .select("id, nom_complet, nom_entreprise, merchant_code") \
+                            .eq("merchant_code", code.strip()) \
+                            .execute()
+
+        # Compter le total des profils
+        total = supabase_admin.table("mm_profiles").select("id, merchant_code").execute()
+        nb_total = len(total.data) if total.data else 0
+        codes_existants = [
+            r.get("merchant_code", "NULL")
+            for r in (total.data or [])
+        ]
+
+        return {
+            "code_recherché":   code.strip(),
+            "trouvé":          len(res.data) > 0,
+            "résultat":        res.data,
+            "total_profils":   nb_total,
+            "codes_existants": codes_existants,
+            "supabase_admin_ok": True
+        }
+    except Exception as e:
+        return {
+            "code_recherché":    code.strip(),
+            "trouvé":           False,
+            "erreur":           str(e),
+            "supabase_admin_ok": False
+        }
+
+
+
 def lister_pending(account_id: int = 0):
     """
     Retourne les transactions en attente de confirmation manuelle.
