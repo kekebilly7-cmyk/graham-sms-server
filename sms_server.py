@@ -321,9 +321,42 @@ def parser_sms_regex(body: str, sender: str) -> dict:
             pass
 
     # ── Numéro de téléphone ───────────────────────────────────────
-    m_phone = re.search(r'\b((?:00229|229)?[679]\d{7})\b', body)
-    if m_phone:
-        result["phone"] = m_phone.group(1)
+    # Format retrait : ",2290198765," (entre virgules)
+    m_tel = re.search(r',\s*(\+?[0-9]{8,13})\s*,', body)
+    if m_tel:
+        result["phone"] = m_tel.group(1).strip()
+    else:
+        m_tel2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body)
+        if m_tel2:
+            result["phone"] = m_tel2.group(1)
+        else:
+            m_tel3 = re.search(r'\b([679]\d{7})\b', body)
+            if m_tel3:
+                result["phone"] = m_tel3.group(1)
+
+    # ── Nom destinataire ──────────────────────────────────────────
+    # Format retrait : "recu de NOM ,"
+    m_nom_ret = re.search(
+        r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
+        body, re.IGNORECASE)
+    if m_nom_ret:
+        result["nom_destinataire"] = m_nom_ret.group(1).strip()
+
+    if not result["nom_destinataire"]:
+        # Format dépôt : "a NOM le"
+        m_nom_dep = re.search(
+            r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s+le\s+\d',
+            body, re.IGNORECASE)
+        if m_nom_dep:
+            result["nom_destinataire"] = m_nom_dep.group(1).strip()
+
+    if not result["nom_destinataire"]:
+        # Format MFS marchand
+        m_mfs = re.search(
+            r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
+            body, re.IGNORECASE)
+        if m_mfs:
+            result["nom_destinataire"] = m_mfs.group(1).strip()
 
     # ── Référence transaction — chercher un vrai ID numérique ─────
     # Priorité aux IDs numériques longs (vrais IDs opérateurs)
@@ -675,71 +708,59 @@ def recevoir_sms(
             logger.error(f"Erreur insertion transaction (minimal): {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
 
-    # ── Extraction nom et téléphone — formats MTN/Moov Bénin ────────
-    # On teste les patterns du plus spécifique au plus général
+    # ── Extraction nom et téléphone — formats SMS réels Bénin ───────
     body_tx = payload.body
 
     if not nom_dest:
-        # Format 1 — Paiement marchand MFS : "de MFS NOM SP"
-        # Ex: "Transfert 1312F de MFS NOWORRI DIS SP 2026-07-01..."
-        m1 = re.search(r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|$)',
-                       body_tx, re.IGNORECASE)
-        if m1:
-            nom_dest = m1.group(1).strip()
+        # Format retrait : "5000F recu de NOM ,TELEPHONE, le DATE"
+        # Nom = entre "recu de" et la virgule suivante
+        m_retrait = re.search(
+            r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
+            body_tx, re.IGNORECASE
+        )
+        if m_retrait:
+            nom_dest = m_retrait.group(1).strip()
 
     if not nom_dest:
-        # Format 2 — Envoi à quelqu'un : "à NOM PRENOM (229XXXXXXXX)"
-        # Ex: "Vous avez envoyé 5000F à Jean Dupont (97123456)"
-        m2 = re.search(r'\bà\s+([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35}?)'
-                       r'\s*\(?\s*(?:00229|229)?([679]\d{7})',
-                       body_tx)
-        if m2:
-            nom_dest = m2.group(1).strip()
-            if not phone and m2.group(2):
-                phone = m2.group(2)
+        # Format dépôt : "depot XXXF a NOM le DATE"
+        # Nom = entre "a" et "le"
+        m_depot = re.search(
+            r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s+le\s+\d',
+            body_tx, re.IGNORECASE
+        )
+        if m_depot:
+            nom_dest = m_depot.group(1).strip()
 
     if not nom_dest:
-        # Format 3 — Reçu de quelqu'un : "de NOM PRENOM (229XXXXXXXX)"
-        # Ex: "Vous avez reçu 5000F de Marie Koffi (97654321)"
-        m3 = re.search(r'\bde\s+([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35}?)'
-                       r'\s*\(?\s*(?:00229|229)?([679]\d{7})',
-                       body_tx)
-        if m3:
-            excl = {"mtn","momo","moov","flooz","celtiis","mfs","vous","votre"}
-            n = m3.group(1).strip()
-            if n.lower().split()[0] not in excl and len(n) > 2:
-                nom_dest = n
-                if not phone and m3.group(2):
-                    phone = m3.group(2)
+        # Format MFS marchand : "de MFS NOM SP DATE"
+        m_mfs = re.search(
+            r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
+            body_tx, re.IGNORECASE
+        )
+        if m_mfs:
+            nom_dest = m_mfs.group(1).strip()
 
-    if not nom_dest:
-        # Format 4 — Après "Destinataire :" ou "Bénéficiaire :"
-        m4 = re.search(r'(?:Destinataire|Bénéficiaire|Beneficiaire)\s*:?\s*'
-                       r'([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35})',
-                       body_tx, re.IGNORECASE)
-        if m4:
-            nom_dest = m4.group(1).strip()
-
-    # ── Extraction téléphone ──────────────────────────────────────
     if not phone:
-        # Format complet avec indicatif : 00229XXXXXXXX ou 229XXXXXXXX
-        m_ph1 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
-        if m_ph1:
-            phone = m_ph1.group(1)
+        # Format retrait : ",2290198765," ou ",229XXXXXXXX,"
+        m_tel = re.search(
+            r',\s*((?:00229|229|0)[0-9]{8,10})\s*,',
+            body_tx
+        )
+        if m_tel:
+            phone = m_tel.group(1).strip()
         else:
-            # Numéro local 8 chiffres entre parenthèses : (97123456)
-            m_ph2 = re.search(r'\(([679]\d{7})\)', body_tx)
-            if m_ph2:
-                phone = m_ph2.group(1)
+            # Numéro avec indicatif sans virgules
+            m_tel2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
+            if m_tel2:
+                phone = m_tel2.group(1)
             else:
-                # Numéro local seul (pas entre parenthèses)
-                m_ph3 = re.search(r'\b([679]\d{7})\b', body_tx)
-                if m_ph3:
-                    phone = m_ph3.group(1)
+                # Numéro local 8 chiffres
+                m_tel3 = re.search(r'\b([679]\d{7})\b', body_tx)
+                if m_tel3:
+                    phone = m_tel3.group(1)
 
-    logger.info(f"✅ Transaction: {operateur} {amount}F raison={raison} "
-                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' "
-                f"statut={statut} source={source}")
+    logger.info(f"✅ {operateur} {amount}F {raison} | "
+                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
 
     # ── Mise à jour cash physique ─────────────────────────────────
     if amount > 0 and statut == "confirmed":
@@ -905,22 +926,30 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                      statut_transaction: str = "confirmed",
                      transaction_id: str = ""):
     """
-    Met à jour le cash physique.
+    Met à jour le cash physique selon la logique Graham POS.
 
-    Priorité 1 — Delta solde SIM (le plus fiable) :
-      Si on a le solde_apres de cette transaction ET le solde de la
-      transaction précédente → delta_sim = solde_apres - solde_avant
-      • delta_sim > 0 : SIM a augmenté → commerçant a donné cash → cash DIMINUE
-      • delta_sim < 0 : SIM a diminué → commerçant a reçu cash → cash AUGMENTE
-
-    Priorité 2 — Type de transaction (fallback si solde absent) :
-      • momo_depot     → cash DIMINUE
-      • momo_transfert → cash AUGMENTE
+    Règle simple et fiable :
+    - momo_depot     → commerçant reçoit mobile → donne cash → cash DIMINUE
+    - momo_transfert → commerçant reçoit cash → envoie mobile → cash AUGMENTE
+    - momo_retrait   → idem transfert → cash AUGMENTE
+    - momo_paiement  → idem transfert → cash AUGMENTE
     """
     if statut_transaction == "pending":
         return
     if not reseau_est_actif(account_id):
         logger.info(f"⏭ Réseau {account_id} OFF")
+        return
+    if amount <= 0:
+        return
+
+    if raison == "momo_depot":
+        delta   = -amount
+        type_mv = "momo_depot_cash"
+    elif raison in ("momo_retrait", "momo_transfert", "momo_paiement", "momo_envoi"):
+        delta   = +amount
+        type_mv = "momo_retrait_cash"
+    else:
+        logger.info(f"⏭ raison={raison} — pas de mise à jour cash")
         return
 
     from datetime import datetime, timezone, timedelta
@@ -928,59 +957,12 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     now_paris = datetime.now(paris)
     debut_utc = now_paris.replace(hour=0, minute=0, second=0, microsecond=0) \
                          .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-    # ── Méthode 1 : delta solde SIM ────────────────────────────────
-    delta = None
-    if solde_apres and solde_apres > 0:
-        try:
-            # Récupérer le solde de la transaction précédente (même account)
-            res_prev = supabase.table("transactions") \
-                               .select("solde") \
-                               .eq("account_id", account_id) \
-                               .not_.is_("solde", "null") \
-                               .gt("solde", 0) \
-                               .order("created_at", desc=True) \
-                               .limit(2).execute()
-
-            # On prend la 2ème (la précédente, pas celle qu'on vient d'insérer)
-            if res_prev.data and len(res_prev.data) >= 2:
-                solde_avant = int(res_prev.data[1].get("solde") or 0)
-                if solde_avant > 0:
-                    delta_sim = solde_apres - solde_avant
-                    if delta_sim > 0:
-                        delta    = -amount   # SIM ↑ → commerçant a donné cash → cash ↓
-                        type_mv  = "momo_depot_cash"
-                        logger.info(f"💡 Delta SIM +{delta_sim}F → cash -{amount}F")
-                    elif delta_sim < 0:
-                        delta    = +amount   # SIM ↓ → commerçant a reçu cash → cash ↑
-                        type_mv  = "momo_retrait_cash"
-                        logger.info(f"💡 Delta SIM {delta_sim}F → cash +{amount}F")
-                    else:
-                        logger.info("💡 Delta SIM = 0 → pas de mise à jour cash")
-                        return
-        except Exception as e:
-            logger.warning(f"Delta solde SIM indisponible: {e} — fallback type")
-
-    # ── Méthode 2 : fallback sur le type de transaction ────────────
-    if delta is None:
-        if raison == "momo_depot":
-            delta   = -amount
-            type_mv = "momo_depot_cash"
-        elif raison in ("momo_retrait", "momo_transfert", "momo_paiement", "momo_envoi"):
-            delta   = +amount
-            type_mv = "momo_retrait_cash"
-        else:
-            logger.info(f"⏭ raison={raison} — pas de mise à jour cash")
-            return
-        logger.info(f"💡 Fallback type={raison} → cash delta={delta:+}F")
-
-    # ── Appliquer le delta au cash ─────────────────────────────────
     try:
+        # Chercher la session du jour OU la plus récente session active
         res = supabase.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
-                      .gte("created_at", debut_utc) \
                       .gt("opening_cash", 0) \
-                      .order("created_at", desc=False) \
+                      .order("created_at", desc=True) \
                       .limit(1).execute()
 
         if not res.data:
@@ -992,6 +974,13 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         if opening <= 0:
             return
 
+        # Vérifier si session du jour (ne pas mettre à jour une ancienne session)
+        sess_date = str(sess.get("created_at",""))[:10]
+        today_str = now_paris.strftime("%Y-%m-%d")
+        if sess_date < today_str:
+            logger.info(f"⏭ Session cash de {sess_date} — pas de session aujourd'hui")
+            return
+
         _cc     = sess.get("current_cash")
         current = float(_cc) if _cc is not None else opening
 
@@ -999,17 +988,17 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
             logger.info(f"⏭ Cash épuisé ({current}F)")
             return
 
-        nouveau = max(0, current + delta)
+        nouveau = max(0.0, current + delta)
 
         supabase.table("cash_sessions") \
                 .update({"current_cash": nouveau}) \
                 .eq("id", sess["id"]).execute()
 
         mv = {
-            "account_id":     account_id,
-            "amount":         delta,
-            "type":           type_mv,
-            "cash_apres":     nouveau,
+            "account_id": account_id,
+            "amount":     delta,
+            "type":       type_mv,
+            "cash_apres": nouveau,
         }
         if transaction_id:
             mv["transaction_id"] = transaction_id
