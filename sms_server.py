@@ -666,24 +666,54 @@ def recevoir_sms(
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
     account_id  = account_map.get(operateur.upper(), 1)
 
+    # ── Extraction nom et téléphone AVANT l'insert ───────────────
+    body_tx = payload.body
+
+    if not nom_dest:
+        m1 = re.search(r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
+                       body_tx, re.IGNORECASE)
+        if m1: nom_dest = m1.group(1).strip()
+
+    if not nom_dest:
+        m2 = re.search(r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s+le\s+\d',
+                       body_tx, re.IGNORECASE)
+        if m2: nom_dest = m2.group(1).strip()
+
+    if not nom_dest:
+        m3 = re.search(r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
+                       body_tx, re.IGNORECASE)
+        if m3: nom_dest = m3.group(1).strip()
+
+    if not phone:
+        m_t1 = re.search(r',\s*(\+?[0-9]{8,13})\s*,', body_tx)
+        if m_t1:
+            phone = m_t1.group(1).strip()
+        else:
+            m_t2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
+            if m_t2: phone = m_t2.group(1)
+            else:
+                m_t3 = re.search(r'\b([679]\d{7})\b', body_tx)
+                if m_t3: phone = m_t3.group(1)
+
+    logger.info(f"📋 {operateur} {amount}F {raison} | "
+                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
+
     # ── Insertion en base ─────────────────────────────────────────
-    # On tente avec tous les champs d'abord, puis fallback minimal si erreur
     insert_data = {
-        "account_id":   account_id,
-        "raison":       raison,
-        "amount":       amount,
-        "phone_number": phone or None,
+        "account_id":       account_id,
+        "raison":           raison,
+        "amount":           amount,
+        "phone_number":     phone or None,
         "nom_destinataire": nom_dest or None,
-        "reference_id": reference or None,
-        "solde":        solde if solde > 0 else None,
-        "frais":        frais,
-        "statut":       statut,
-        "raw_message":  payload.body,
-        "sender":       payload.sender,
-        "sms_hash":     sms_hash,  # pour la déduplication
+        "reference_id":     reference or None,
+        "solde":            solde if solde > 0 else None,
+        "frais":            frais,
+        "statut":           statut,
+        "raw_message":      payload.body,
+        "sender":           payload.sender,
+        "sms_hash":         sms_hash,
     }
 
-    # Champs étendus (ajoutés progressivement — best effort)
     optional_fields = {
         "confiance_ia":   confiance,
         "source_parsing": source,
@@ -701,76 +731,28 @@ def recevoir_sms(
         ).execute()
     except Exception as e:
         logger.warning(f"Insert complet échoué ({e}) — tentative minimale")
-        # Fallback : insert avec seulement les colonnes de base
         try:
             res_ins = supabase.table("transactions").insert(insert_data).execute()
         except Exception as e2:
-            logger.error(f"Erreur insertion transaction (minimal): {e2}")
+            logger.error(f"Erreur insertion: {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
 
-    # ── Extraction nom et téléphone — formats SMS réels Bénin ───────
-    body_tx = payload.body
-
-    if not nom_dest:
-        # Format retrait : "5000F recu de NOM ,TELEPHONE, le DATE"
-        # Nom = entre "recu de" et la virgule suivante
-        m_retrait = re.search(
-            r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
-            body_tx, re.IGNORECASE
-        )
-        if m_retrait:
-            nom_dest = m_retrait.group(1).strip()
-
-    if not nom_dest:
-        # Format dépôt : "depot XXXF a NOM le DATE"
-        # Nom = entre "a" et "le"
-        m_depot = re.search(
-            r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s+le\s+\d',
-            body_tx, re.IGNORECASE
-        )
-        if m_depot:
-            nom_dest = m_depot.group(1).strip()
-
-    if not nom_dest:
-        # Format MFS marchand : "de MFS NOM SP DATE"
-        m_mfs = re.search(
-            r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
-            body_tx, re.IGNORECASE
-        )
-        if m_mfs:
-            nom_dest = m_mfs.group(1).strip()
-
-    if not phone:
-        # Format retrait : ",2290198765," ou ",229XXXXXXXX,"
-        m_tel = re.search(
-            r',\s*((?:00229|229|0)[0-9]{8,10})\s*,',
-            body_tx
-        )
-        if m_tel:
-            phone = m_tel.group(1).strip()
-        else:
-            # Numéro avec indicatif sans virgules
-            m_tel2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
-            if m_tel2:
-                phone = m_tel2.group(1)
-            else:
-                # Numéro local 8 chiffres
-                m_tel3 = re.search(r'\b([679]\d{7})\b', body_tx)
-                if m_tel3:
-                    phone = m_tel3.group(1)
-
-    logger.info(f"✅ {operateur} {amount}F {raison} | "
-                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
+    # ── ID de la transaction insérée ──────────────────────────────
+    tx_id_str = str(res_ins.data[0]["id"]) if res_ins.data else ""
+    logger.info(f"✅ Transaction insérée id={tx_id_str} | {operateur} {amount}F {raison}")
 
     # ── Mise à jour cash physique ─────────────────────────────────
     if amount > 0 and statut == "confirmed":
         try:
-            maj_current_cash(account_id, amount, raison,
-                             solde_apres=solde,
-                             statut_transaction=statut,
-                             transaction_id=tx_id_str)
+            maj_current_cash(
+                account_id      = account_id,
+                amount          = amount,
+                raison          = raison,
+                statut_transaction = statut,
+                transaction_id  = tx_id_str
+            )
         except Exception as e_cash:
-            logger.error(f"Erreur cash update: {e_cash}")
+            logger.error(f"Erreur maj cash: {e_cash}")
 
     return {
         "status":   "success",
