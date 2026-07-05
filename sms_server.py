@@ -675,42 +675,71 @@ def recevoir_sms(
             logger.error(f"Erreur insertion transaction (minimal): {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
 
-    # ── Extraction nom destinataire améliorée ─────────────────────
-    # Le regex de base peut manquer le nom dans certains formats MTN/Moov
-    if not nom_dest:
-        # Format : "a NOM PRENOM (229XXXXXXX)"
-        m_nom = re.search(
-            r'\ba\s+([A-ZÀ-Ça-zà-ç][A-ZÀ-Ça-zà-ç\s\-\.]{2,40}?)\s*[\(\d]',
-            payload.body
-        )
-        if m_nom:
-            nom_dest = m_nom.group(1).strip()
-        else:
-            # Format : "de NOM PRENOM"
-            m_nom2 = re.search(
-                r'\bde\s+([A-ZÀ-Ça-zà-ç][A-ZÀ-Ça-zà-ç\s\-\.]{2,40}?)'
-                r'\s*(?:\(|\.|,|Réf|ID|\d)',
-                payload.body
-            )
-            if m_nom2:
-                excl = {"mtn","momo","moov","fcfa","vous","avez","votre","compte"}
-                n = m_nom2.group(1).strip()
-                if n.lower() not in excl and len(n) > 2:
-                    nom_dest = n
+    # ── Extraction nom et téléphone — formats MTN/Moov Bénin ────────
+    # On teste les patterns du plus spécifique au plus général
+    body_tx = payload.body
 
-    # ── Extraction numéro améliorée ───────────────────────────────
+    if not nom_dest:
+        # Format 1 — Paiement marchand MFS : "de MFS NOM SP"
+        # Ex: "Transfert 1312F de MFS NOWORRI DIS SP 2026-07-01..."
+        m1 = re.search(r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|$)',
+                       body_tx, re.IGNORECASE)
+        if m1:
+            nom_dest = m1.group(1).strip()
+
+    if not nom_dest:
+        # Format 2 — Envoi à quelqu'un : "à NOM PRENOM (229XXXXXXXX)"
+        # Ex: "Vous avez envoyé 5000F à Jean Dupont (97123456)"
+        m2 = re.search(r'\bà\s+([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35}?)'
+                       r'\s*\(?\s*(?:00229|229)?([679]\d{7})',
+                       body_tx)
+        if m2:
+            nom_dest = m2.group(1).strip()
+            if not phone and m2.group(2):
+                phone = m2.group(2)
+
+    if not nom_dest:
+        # Format 3 — Reçu de quelqu'un : "de NOM PRENOM (229XXXXXXXX)"
+        # Ex: "Vous avez reçu 5000F de Marie Koffi (97654321)"
+        m3 = re.search(r'\bde\s+([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35}?)'
+                       r'\s*\(?\s*(?:00229|229)?([679]\d{7})',
+                       body_tx)
+        if m3:
+            excl = {"mtn","momo","moov","flooz","celtiis","mfs","vous","votre"}
+            n = m3.group(1).strip()
+            if n.lower().split()[0] not in excl and len(n) > 2:
+                nom_dest = n
+                if not phone and m3.group(2):
+                    phone = m3.group(2)
+
+    if not nom_dest:
+        # Format 4 — Après "Destinataire :" ou "Bénéficiaire :"
+        m4 = re.search(r'(?:Destinataire|Bénéficiaire|Beneficiaire)\s*:?\s*'
+                       r'([A-ZÀ-Ça-zà-ç][A-Za-zÀ-ÿ\s\-\.]{2,35})',
+                       body_tx, re.IGNORECASE)
+        if m4:
+            nom_dest = m4.group(1).strip()
+
+    # ── Extraction téléphone ──────────────────────────────────────
     if not phone:
-        m_ph = re.search(r'\b((?:00229|229)[679]\d{7})\b', payload.body)
-        if m_ph:
-            phone = m_ph.group(1)
+        # Format complet avec indicatif : 00229XXXXXXXX ou 229XXXXXXXX
+        m_ph1 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
+        if m_ph1:
+            phone = m_ph1.group(1)
         else:
-            m_ph2 = re.search(r'\b([679]\d{7})\b', payload.body)
+            # Numéro local 8 chiffres entre parenthèses : (97123456)
+            m_ph2 = re.search(r'\(([679]\d{7})\)', body_tx)
             if m_ph2:
                 phone = m_ph2.group(1)
+            else:
+                # Numéro local seul (pas entre parenthèses)
+                m_ph3 = re.search(r'\b([679]\d{7})\b', body_tx)
+                if m_ph3:
+                    phone = m_ph3.group(1)
 
-    tx_id_str = str(res_ins.data[0]["id"]) if res_ins.data else ""
     logger.info(f"✅ Transaction: {operateur} {amount}F raison={raison} "
-                f"statut={statut} source={source} device={device_id[:8]}...")
+                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' "
+                f"statut={statut} source={source}")
 
     # ── Mise à jour cash physique ─────────────────────────────────
     if amount > 0 and statut == "confirmed":
