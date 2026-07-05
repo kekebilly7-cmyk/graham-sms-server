@@ -593,11 +593,12 @@ def recevoir_sms(
         pass
 
     # ── Déduplication robuste ─────────────────────────────────────
-    # On utilise un hash du corps du SMS + device_id pour éviter les doublons
-    # même quand reference_id est absent ou identique (nom de société)
+    # ── Déduplication : hash = device_id + timestamp + corps complet ──
+    # Le timestamp garantit l'unicité même si deux SMS ont le même contenu
+    # (ex: deux transferts NOWORRI du même montant à des heures différentes)
     import hashlib
     sms_hash = hashlib.md5(
-        f"{device_id}|{payload.body[:100]}".encode()
+        f"{device_id}|{payload.timestamp}|{payload.body}".encode()
     ).hexdigest()
 
     try:
@@ -607,11 +608,11 @@ def recevoir_sms(
                            .eq("sms_hash",  sms_hash) \
                            .execute()
         if existing.data:
-            logger.info(f"Doublon détecté (hash={sms_hash[:8]}) — ignoré")
+            # Vrai doublon : même appareil, même timestamp, même corps → retry app
+            logger.info(f"Vrai doublon ignoré (device+timestamp+body identiques)")
             return {"status": "duplicate", "id": existing.data[0]["id"]}
     except Exception:
-        # Colonne sms_hash peut ne pas exister encore → continuer sans déduplication
-        pass
+        pass  # Colonne absente → continuer sans déduplication
 
     # ── Parsing IA + fallback regex ───────────────────────────────
     parsed, source = parser_sms(payload.body, payload.sender)
@@ -715,6 +716,7 @@ def recevoir_sms(
     if amount > 0 and statut == "confirmed":
         try:
             maj_current_cash(account_id, amount, raison,
+                             solde_apres=solde,
                              statut_transaction=statut,
                              transaction_id=tx_id_str)
         except Exception as e_cash:
@@ -870,29 +872,26 @@ def reseau_est_actif(account_id: int) -> bool:
 
 
 def maj_current_cash(account_id: int, amount: int, raison: str,
+                     solde_apres: int = 0,
                      statut_transaction: str = "confirmed",
                      transaction_id: str = ""):
     """
-    Met à jour le cash physique selon la logique Graham POS.
+    Met à jour le cash physique.
 
-    Règle métier :
-    - momo_depot : commerçant reçoit mobile money → donne cash → cash DIMINUE
-    - momo_retrait/transfert/paiement : commerçant reçoit cash → envoie mobile → cash AUGMENTE
+    Priorité 1 — Delta solde SIM (le plus fiable) :
+      Si on a le solde_apres de cette transaction ET le solde de la
+      transaction précédente → delta_sim = solde_apres - solde_avant
+      • delta_sim > 0 : SIM a augmenté → commerçant a donné cash → cash DIMINUE
+      • delta_sim < 0 : SIM a diminué → commerçant a reçu cash → cash AUGMENTE
+
+    Priorité 2 — Type de transaction (fallback si solde absent) :
+      • momo_depot     → cash DIMINUE
+      • momo_transfert → cash AUGMENTE
     """
     if statut_transaction == "pending":
         return
-
     if not reseau_est_actif(account_id):
         logger.info(f"⏭ Réseau {account_id} OFF")
-        return
-
-    if raison == "momo_depot":
-        delta   = -amount        # cash physique diminue
-        type_mv = "momo_depot_cash"
-    elif raison in ("momo_retrait", "momo_transfert", "momo_paiement", "momo_envoi"):
-        delta   = +amount        # cash physique augmente
-        type_mv = "momo_retrait_cash"
-    else:
         return
 
     from datetime import datetime, timezone, timedelta
@@ -900,6 +899,53 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     now_paris = datetime.now(paris)
     debut_utc = now_paris.replace(hour=0, minute=0, second=0, microsecond=0) \
                          .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # ── Méthode 1 : delta solde SIM ────────────────────────────────
+    delta = None
+    if solde_apres and solde_apres > 0:
+        try:
+            # Récupérer le solde de la transaction précédente (même account)
+            res_prev = supabase.table("transactions") \
+                               .select("solde") \
+                               .eq("account_id", account_id) \
+                               .not_.is_("solde", "null") \
+                               .gt("solde", 0) \
+                               .order("created_at", desc=True) \
+                               .limit(2).execute()
+
+            # On prend la 2ème (la précédente, pas celle qu'on vient d'insérer)
+            if res_prev.data and len(res_prev.data) >= 2:
+                solde_avant = int(res_prev.data[1].get("solde") or 0)
+                if solde_avant > 0:
+                    delta_sim = solde_apres - solde_avant
+                    if delta_sim > 0:
+                        delta    = -amount   # SIM ↑ → commerçant a donné cash → cash ↓
+                        type_mv  = "momo_depot_cash"
+                        logger.info(f"💡 Delta SIM +{delta_sim}F → cash -{amount}F")
+                    elif delta_sim < 0:
+                        delta    = +amount   # SIM ↓ → commerçant a reçu cash → cash ↑
+                        type_mv  = "momo_retrait_cash"
+                        logger.info(f"💡 Delta SIM {delta_sim}F → cash +{amount}F")
+                    else:
+                        logger.info("💡 Delta SIM = 0 → pas de mise à jour cash")
+                        return
+        except Exception as e:
+            logger.warning(f"Delta solde SIM indisponible: {e} — fallback type")
+
+    # ── Méthode 2 : fallback sur le type de transaction ────────────
+    if delta is None:
+        if raison == "momo_depot":
+            delta   = -amount
+            type_mv = "momo_depot_cash"
+        elif raison in ("momo_retrait", "momo_transfert", "momo_paiement", "momo_envoi"):
+            delta   = +amount
+            type_mv = "momo_retrait_cash"
+        else:
+            logger.info(f"⏭ raison={raison} — pas de mise à jour cash")
+            return
+        logger.info(f"💡 Fallback type={raison} → cash delta={delta:+}F")
+
+    # ── Appliquer le delta au cash ─────────────────────────────────
     try:
         res = supabase.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
@@ -907,6 +953,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                       .gt("opening_cash", 0) \
                       .order("created_at", desc=False) \
                       .limit(1).execute()
+
         if not res.data:
             logger.info(f"⏭ Aucune session cash (account_id={account_id})")
             return
@@ -918,8 +965,9 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
 
         _cc     = sess.get("current_cash")
         current = float(_cc) if _cc is not None else opening
+
         if current <= 0 and delta < 0:
-            logger.info(f"⏭ Cash épuisé")
+            logger.info(f"⏭ Cash épuisé ({current}F)")
             return
 
         nouveau = max(0, current + delta)
@@ -928,14 +976,18 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                 .update({"current_cash": nouveau}) \
                 .eq("id", sess["id"]).execute()
 
-        mv = {"account_id": account_id, "amount": delta,
-              "type": type_mv, "cash_apres": nouveau}
+        mv = {
+            "account_id":     account_id,
+            "amount":         delta,
+            "type":           type_mv,
+            "cash_apres":     nouveau,
+        }
         if transaction_id:
             mv["transaction_id"] = transaction_id
         supabase.table("cash_movements").insert(mv).execute()
 
         sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
-        logger.info(f"💵 Cash {sens} F | {current:.0f}→{nouveau:.0f} F | {raison}")
+        logger.info(f"💵 Cash {sens}F | {current:.0f}→{nouveau:.0f}F | {raison}")
 
     except Exception as e:
         logger.error(f"Erreur maj_current_cash: {e}")
