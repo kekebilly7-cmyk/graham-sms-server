@@ -934,60 +934,48 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_nouveau: int = 0, solde_ancien: int = 0,
                      transaction_id: str = ""):
     """
-    Met à jour le cash physique.
+    DEPOT  (client donne cash, merchant crédite téléphone) :
+      → physique AUGMENTE (+amount), virtuel DIMINUE  (-amount)
+      → Détecté : delta_sim < 0 OU raison=momo_depot
 
-    Logique prioritaire — delta solde SIM :
-      delta_sim = solde_nouveau - solde_ancien
-      • delta_sim > 0 : solde SIM ↑ → commerçant a donné cash → cash DIMINUE
-      • delta_sim < 0 : solde SIM ↓ → commerçant a reçu cash → cash AUGMENTE
-
-    Fallback si soldes absents — type de transaction :
-      • momo_depot     → cash DIMINUE
-      • momo_transfert → cash AUGMENTE
+    RETRAIT (client retire cash, merchant reçoit mobile) :
+      → physique DIMINUE  (-amount), virtuel AUGMENTE (+amount)
+      → Détecté : delta_sim > 0 OU raison=momo_retrait/transfert
     """
     if amount <= 0:
         return
 
-    # ── Déterminer le delta cash ──────────────────────────────────
     if solde_nouveau > 0 and solde_ancien > 0:
         delta_sim = solde_nouveau - solde_ancien
-        if delta_sim > 0:
-            delta   = -amount   # SIM ↑ → commerçant a donné cash → cash ↓
-            type_mv = "momo_depot_cash"
-            logger.info(f"💡 Solde SIM {solde_ancien}→{solde_nouveau} (+{delta_sim}) → cash -{amount}F")
-        elif delta_sim < 0:
-            delta   = +amount   # SIM ↓ → commerçant a reçu cash → cash ↑
-            type_mv = "momo_retrait_cash"
-            logger.info(f"💡 Solde SIM {solde_ancien}→{solde_nouveau} ({delta_sim}) → cash +{amount}F")
+        if delta_sim < 0:
+            type_op        = "DEPOT"
+            delta_physique = +amount
+            logger.info(f"💡 SIM {solde_ancien}→{solde_nouveau} (delta={delta_sim:+}) → DEPOT physique+{amount}F")
+        elif delta_sim > 0:
+            type_op        = "RETRAIT"
+            delta_physique = -amount
+            logger.info(f"💡 SIM {solde_ancien}→{solde_nouveau} (delta={delta_sim:+}) → RETRAIT physique-{amount}F")
         else:
-            logger.info(f"💡 Solde SIM inchangé → pas de mise à jour cash")
             return
     else:
-        # Fallback sur le type de transaction
         if raison == "momo_depot":
-            delta   = -amount
-            type_mv = "momo_depot_cash"
+            type_op        = "DEPOT"
+            delta_physique = +amount
         elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-            delta   = +amount
-            type_mv = "momo_retrait_cash"
+            type_op        = "RETRAIT"
+            delta_physique = -amount
         else:
-            logger.info(f"⏭ raison={raison} non gérée")
             return
-        logger.info(f"💡 Fallback raison={raison} → cash delta={delta:+}F")
+        logger.info(f"💡 Fallback {raison} → {type_op} physique{delta_physique:+}F")
 
-    # ── Vérifier réseau ON ────────────────────────────────────────
     if not reseau_est_actif(account_id):
-        logger.info(f"⏭ Réseau {account_id} OFF → cash non mis à jour")
         return
 
-    # ── Lire la session cash active ───────────────────────────────
     from datetime import datetime, timezone, timedelta
     paris     = timezone(timedelta(hours=2))
-    now_paris = datetime.now(paris)
-    today_str = now_paris.strftime("%Y-%m-%d")
+    today_str = datetime.now(paris).strftime("%Y-%m-%d")
 
     try:
-        # Prendre la session la plus récente avec cash départ saisi
         res = supabase.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
                       .gt("opening_cash", 0) \
@@ -995,45 +983,62 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                       .limit(1).execute()
 
         if not res.data:
-            logger.info(f"⏭ Aucune session cash — saisir un cash départ d'abord")
+            logger.info("⏭ Aucune session cash")
             return
 
-        sess = res.data[0]
-
-        # Vérifier que c'est bien une session d'aujourd'hui
-        sess_date = str(sess.get("created_at",""))[:10]  # "2026-07-05"
+        sess      = res.data[0]
+        sess_date = str(sess.get("created_at",""))[:10]
         if sess_date != today_str:
-            logger.info(f"⏭ Session du {sess_date} ≠ aujourd'hui {today_str}")
+            logger.info(f"⏭ Session du {sess_date} ≠ {today_str}")
             return
 
-        opening = float(sess.get("opening_cash") or 0)
-        _cc     = sess.get("current_cash")
-        current = float(_cc) if _cc is not None else opening
+        # Cash physique
+        opening_p  = float(sess.get("opening_cash",    0) or 0)
+        current_p  = float(sess.get("current_cash",    opening_p) or opening_p)
+        nouveau_p  = max(0.0, current_p + delta_physique)
 
-        if current <= 0 and delta < 0:
-            logger.info(f"⏭ Cash épuisé ({current:.0f}F)")
-            return
+        # Cash virtuel (SIM balance)
+        opening_v  = float(sess.get("opening_virtuel", 0) or 0)
+        current_v  = float(sess.get("current_virtuel", opening_v) or opening_v)
+        if current_v == 0 and solde_ancien > 0:
+            current_v = float(solde_ancien)
+        nouveau_v  = float(solde_nouveau) if solde_nouveau > 0 else max(0.0, current_v - delta_physique)
 
-        nouveau = max(0.0, current + delta)
+        # Mettre à jour la session
+        supabase.table("cash_sessions").update({
+            "current_cash":    nouveau_p,
+            "current_virtuel": nouveau_v,
+        }).eq("id", sess["id"]).execute()
 
-        # Mettre à jour current_cash
-        supabase.table("cash_sessions") \
-                .update({"current_cash": nouveau}) \
-                .eq("id", sess["id"]).execute()
-
-        # Enregistrer dans cash_movements
+        # Enregistrement immuable du mouvement
         mv = {
-            "account_id": account_id,
-            "amount":     delta,
-            "type":       type_mv,
-            "cash_apres": nouveau,
+            "account_id":       account_id,
+            "amount":           delta_physique,
+            "type":             type_op,
+            "cash_apres":       nouveau_p,
+        }
+        # Champs étendus (best-effort si colonnes pas encore créées)
+        mv_ext = {
+            "type_operation":   type_op,
+            "ancien_physique":  current_p,
+            "nouveau_physique": nouveau_p,
+            "ancien_virtuel":   current_v,
+            "nouveau_virtuel":  nouveau_v,
         }
         if transaction_id:
             mv["transaction_id"] = transaction_id
-        supabase.table("cash_movements").insert(mv).execute()
+            mv_ext["transaction_id"] = transaction_id
 
-        sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
-        logger.info(f"💵 Cash {sens}F | {current:.0f}→{nouveau:.0f}F OK")
+        try:
+            supabase.table("cash_movements").insert({**mv, **mv_ext}).execute()
+        except Exception:
+            supabase.table("cash_movements").insert(mv).execute()
+
+        logger.info(
+            f"💵 {type_op} {amount}F | "
+            f"Physique: {current_p:.0f}→{nouveau_p:.0f}F | "
+            f"Virtuel: {current_v:.0f}→{nouveau_v:.0f}F"
+        )
 
     except Exception as e:
         logger.error(f"Erreur maj_current_cash: {e}")
