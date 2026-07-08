@@ -845,7 +845,54 @@ def confirmer_transaction(
 # LISTE DES TRANSACTIONS PENDING — pour Graham POS
 # ────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/debug/code/{code}")
+@app.get("/api/debug/cash/{account_id}")
+def debug_cash(account_id: int):
+    """
+    Diagnostic rapide de l'état du cash pour un compte.
+    Appeler depuis le navigateur pour vérifier sans envoyer de SMS.
+    """
+    try:
+        res = supabase_admin.table("cash_sessions").select("*") \
+                      .eq("account_id", account_id) \
+                      .eq("actif", True) \
+                      .gt("opening_cash", 0) \
+                      .order("created_at", desc=True) \
+                      .limit(1).execute()
+        session = res.data[0] if res.data else None
+    except Exception as e:
+        session = None
+
+    try:
+        mvs = supabase.table("cash_movements").select("*") \
+                      .eq("account_id", account_id) \
+                      .order("created_at", desc=True) \
+                      .limit(5).execute()
+        mouvements = mvs.data or []
+    except Exception:
+        mouvements = []
+
+    return {
+        "account_id":     account_id,
+        "session_active": session is not None,
+        "session":        session,
+        "derniers_mouvements": mouvements,
+        "message": "Session active ✅" if session else
+                   "❌ Aucune session active — saisir cash départ dans Mobile Money System"
+    }
+
+
+@app.post("/api/test/cash")
+def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT"):
+    """
+    Tester manuellement la mise à jour cash.
+    type_op: DEPOT ou RETRAIT
+    """
+    raison = "momo_depot" if type_op == "DEPOT" else "momo_retrait"
+    maj_current_cash(account_id, amount, raison, transaction_id="TEST")
+    return {"status": "ok", "type_op": type_op, "amount": amount,
+            "message": f"Test {type_op} {amount}F exécuté — voir les logs Render"}
+
+
 def debug_code(code: str):
     """
     Endpoint de diagnostic — vérifie si un code existe dans mm_profiles.
@@ -914,7 +961,7 @@ def reseau_est_actif(account_id: int) -> bool:
     debut_utc = now_paris.replace(hour=0, minute=0, second=0, microsecond=0) \
                          .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     try:
-        res = supabase.table("cash_sessions").select("actif") \
+        res = supabase_admin.table("cash_sessions").select("actif") \
                       .eq("account_id", account_id) \
                       .gte("created_at", debut_utc) \
                       .gt("opening_cash", 0) \
@@ -934,125 +981,111 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_nouveau: int = 0, solde_ancien: int = 0,
                      transaction_id: str = ""):
     """
-    DEPOT  (client donne cash, merchant crédite téléphone) :
-      → physique AUGMENTE (+amount), virtuel DIMINUE  (-amount)
-      → Détecté : delta_sim < 0 OU raison=momo_depot
+    Logique agent Mobile Money :
+      DEPOT  (client donne cash → merchant crédite SIM) :
+        physique +amount | virtuel -amount
+      RETRAIT (client retire cash ← merchant débite SIM) :
+        physique -amount | virtuel +amount
 
-    RETRAIT (client retire cash, merchant reçoit mobile) :
-      → physique DIMINUE  (-amount), virtuel AUGMENTE (+amount)
-      → Détecté : delta_sim > 0 OU raison=momo_retrait/transfert
+    Détection par delta SIM en priorité, fallback sur raison.
     """
     if amount <= 0:
+        logger.info(f"⏭ Cash ignoré — amount={amount}")
         return
 
+    # ── 1. Déterminer le type ────────────────────────────────────
     if solde_nouveau > 0 and solde_ancien > 0:
         delta_sim = solde_nouveau - solde_ancien
         if delta_sim < 0:
-            type_op        = "DEPOT"
-            delta_physique = +amount
-            logger.info(f"💡 SIM {solde_ancien}→{solde_nouveau} (delta={delta_sim:+}) → DEPOT physique+{amount}F")
+            type_op = "DEPOT"    # SIM a diminué → merchant a envoyé mobile → reçu cash
+            dp = +amount; dv = -amount
         elif delta_sim > 0:
-            type_op        = "RETRAIT"
-            delta_physique = -amount
-            logger.info(f"💡 SIM {solde_ancien}→{solde_nouveau} (delta={delta_sim:+}) → RETRAIT physique-{amount}F")
+            type_op = "RETRAIT"  # SIM a augmenté → merchant a reçu mobile → donné cash
+            dp = -amount; dv = +amount
         else:
+            logger.info("⏭ Delta SIM = 0 → pas de maj cash")
             return
+        logger.info(f"💡 {type_op} détecté via solde SIM ({solde_ancien}→{solde_nouveau})")
     else:
         if raison == "momo_depot":
-            type_op        = "DEPOT"
-            delta_physique = +amount
+            type_op = "DEPOT";   dp = +amount; dv = -amount
         elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-            type_op        = "RETRAIT"
-            delta_physique = -amount
+            type_op = "RETRAIT"; dp = -amount; dv = +amount
         else:
+            logger.info(f"⏭ raison={raison} — pas de maj cash")
             return
-        logger.info(f"💡 Fallback {raison} → {type_op} physique{delta_physique:+}F")
+        logger.info(f"💡 {type_op} détecté via raison={raison}")
 
+    # ── 2. Vérifier réseau ON ─────────────────────────────────────
     if not reseau_est_actif(account_id):
-        return
+        logger.info(f"⏭ Réseau {account_id} OFF"); return
 
-    from datetime import datetime, timezone, timedelta
-    paris     = timezone(timedelta(hours=2))
-    today_str = datetime.now(paris).strftime("%Y-%m-%d")
-
+    # ── 3. Chercher la session active (sans vérification de date stricte) ─
     try:
-        res = supabase.table("cash_sessions").select("*") \
+        res = supabase_admin.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
+                      .eq("actif", True) \
                       .gt("opening_cash", 0) \
                       .order("created_at", desc=True) \
                       .limit(1).execute()
+    except Exception as e:
+        logger.error(f"Erreur lecture session: {e}"); return
 
-        if not res.data:
-            logger.info("⏭ Aucune session cash — saisir cash départ dans Mobile Money System")
-            return
+    if not res.data:
+        logger.info("⏭ Aucune session active — saisir cash départ dans Mobile Money System")
+        return
 
-        sess = res.data[0]
+    sess = res.data[0]
+    sess_id = sess["id"]
 
-        # Convertir la date de session en heure Paris (évite le bug UTC/Paris)
-        # Ex: session créée à 22h30 UTC = 00h30 Paris le lendemain
-        sess_raw = str(sess.get("created_at","")).replace("Z", "+00:00")
-        try:
-            from datetime import datetime, timezone, timedelta
-            paris_tz     = timezone(timedelta(hours=2))
-            sess_dt      = datetime.fromisoformat(sess_raw).astimezone(paris_tz)
-            sess_date_p  = sess_dt.strftime("%Y-%m-%d")
-        except Exception:
-            sess_date_p  = sess_raw[:10]
+    # Cash physique
+    current_p = float(sess.get("current_cash") or sess.get("opening_cash") or 0)
+    nouveau_p = max(0.0, current_p + dp)
 
-        if sess_date_p != today_str:
-            logger.info(f"⏭ Session du {sess_date_p} ≠ aujourd'hui {today_str} — créer une session aujourd'hui")
-            return
+    # Cash virtuel
+    current_v = float(sess.get("current_virtuel") or sess.get("opening_virtuel") or 0)
+    if current_v == 0 and solde_ancien > 0:
+        current_v = float(solde_ancien)
+    nouveau_v = float(solde_nouveau) if solde_nouveau > 0 else max(0.0, current_v + dv)
 
-        # Cash physique
-        opening_p  = float(sess.get("opening_cash",    0) or 0)
-        current_p  = float(sess.get("current_cash",    opening_p) or opening_p)
-        nouveau_p  = max(0.0, current_p + delta_physique)
+    logger.info(
+        f"💵 {type_op} {amount}F | "
+        f"Physique: {current_p:.0f}→{nouveau_p:.0f} | "
+        f"Virtuel: {current_v:.0f}→{nouveau_v:.0f}"
+    )
 
-        # Cash virtuel (SIM balance)
-        opening_v  = float(sess.get("opening_virtuel", 0) or 0)
-        current_v  = float(sess.get("current_virtuel", opening_v) or opening_v)
-        if current_v == 0 and solde_ancien > 0:
-            current_v = float(solde_ancien)
-        nouveau_v  = float(solde_nouveau) if solde_nouveau > 0 else max(0.0, current_v - delta_physique)
-
-        # Mettre à jour la session
-        supabase.table("cash_sessions").update({
+    # ── 4. Mettre à jour la session ───────────────────────────────
+    try:
+        supabase_admin.table("cash_sessions").update({
             "current_cash":    nouveau_p,
             "current_virtuel": nouveau_v,
-        }).eq("id", sess["id"]).execute()
-
-        # Enregistrement immuable du mouvement
-        mv = {
-            "account_id":       account_id,
-            "amount":           delta_physique,
-            "type":             type_op,
-            "cash_apres":       nouveau_p,
-        }
-        # Champs étendus (best-effort si colonnes pas encore créées)
-        mv_ext = {
-            "type_operation":   type_op,
-            "ancien_physique":  current_p,
-            "nouveau_physique": nouveau_p,
-            "ancien_virtuel":   current_v,
-            "nouveau_virtuel":  nouveau_v,
-        }
-        if transaction_id:
-            mv["transaction_id"] = transaction_id
-            mv_ext["transaction_id"] = transaction_id
-
-        try:
-            supabase.table("cash_movements").insert({**mv, **mv_ext}).execute()
-        except Exception:
-            supabase.table("cash_movements").insert(mv).execute()
-
-        logger.info(
-            f"💵 {type_op} {amount}F | "
-            f"Physique: {current_p:.0f}→{nouveau_p:.0f}F | "
-            f"Virtuel: {current_v:.0f}→{nouveau_v:.0f}F"
-        )
-
+        }).eq("id", sess_id).execute()
     except Exception as e:
-        logger.error(f"Erreur maj_current_cash: {e}")
+        logger.error(f"Erreur update session cash: {e}"); return
+
+    # ── 5. Enregistrer mouvement immuable ─────────────────────────
+    mv_base = {
+        "account_id": account_id,
+        "amount":     dp,
+        "type":       type_op,
+        "cash_apres": nouveau_p,
+    }
+    mv_ext = {
+        "type_operation":   type_op,
+        "ancien_physique":  current_p,
+        "nouveau_physique": nouveau_p,
+        "ancien_virtuel":   current_v,
+        "nouveau_virtuel":  nouveau_v,
+    }
+    if transaction_id:
+        mv_base["transaction_id"] = transaction_id
+    try:
+        supabase_admin.table("cash_movements").insert({**mv_base, **mv_ext}).execute()
+    except Exception:
+        try:
+            supabase_admin.table("cash_movements").insert(mv_base).execute()
+        except Exception as e2:
+            logger.error(f"Erreur insert mouvement: {e2}")
 
 
 def _detecter_operateur(sender: str, body: str) -> str:
