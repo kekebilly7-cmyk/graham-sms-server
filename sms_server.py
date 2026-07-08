@@ -1055,10 +1055,22 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
 
     # ── 4. Mettre à jour la session ───────────────────────────────
     try:
-        supabase_admin.table("cash_sessions").update({
+        res_upd = supabase_admin.table("cash_sessions").update({
             "current_cash":    nouveau_p,
             "current_virtuel": nouveau_v,
         }).eq("id", sess_id).execute()
+
+        nb_updated = len(res_upd.data) if res_upd.data else 0
+        if nb_updated > 0:
+            logger.info(f"✅ Session {sess_id} mise à jour : cash {current_p:.0f}→{nouveau_p:.0f}F")
+        else:
+            logger.error(f"❌ UPDATE session échoué (0 lignes) — RLS encore actif ? session_id={sess_id}")
+            # Tentative avec supabase normal en fallback
+            supabase.table("cash_sessions").update({
+                "current_cash":    nouveau_p,
+                "current_virtuel": nouveau_v,
+            }).eq("id", sess_id).execute()
+            logger.info(f"✅ Fallback supabase anon — cash mis à jour")
     except Exception as e:
         logger.error(f"Erreur update session cash: {e}"); return
 
