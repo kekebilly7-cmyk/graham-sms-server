@@ -983,13 +983,24 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                       .limit(1).execute()
 
         if not res.data:
-            logger.info("⏭ Aucune session cash")
+            logger.info("⏭ Aucune session cash — saisir cash départ dans Mobile Money System")
             return
 
-        sess      = res.data[0]
-        sess_date = str(sess.get("created_at",""))[:10]
-        if sess_date != today_str:
-            logger.info(f"⏭ Session du {sess_date} ≠ {today_str}")
+        sess = res.data[0]
+
+        # Convertir la date de session en heure Paris (évite le bug UTC/Paris)
+        # Ex: session créée à 22h30 UTC = 00h30 Paris le lendemain
+        sess_raw = str(sess.get("created_at","")).replace("Z", "+00:00")
+        try:
+            from datetime import datetime, timezone, timedelta
+            paris_tz     = timezone(timedelta(hours=2))
+            sess_dt      = datetime.fromisoformat(sess_raw).astimezone(paris_tz)
+            sess_date_p  = sess_dt.strftime("%Y-%m-%d")
+        except Exception:
+            sess_date_p  = sess_raw[:10]
+
+        if sess_date_p != today_str:
+            logger.info(f"⏭ Session du {sess_date_p} ≠ aujourd'hui {today_str} — créer une session aujourd'hui")
             return
 
         # Cash physique
