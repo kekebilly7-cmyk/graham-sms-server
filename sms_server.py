@@ -213,12 +213,7 @@ Ne réponds qu'avec le JSON, aucun texte autour."""
         def timeout_handler(signum, frame):
             raise TimeoutError("IA timeout")
 
-        # Sur Linux (Render), on peut utiliser signal.alarm
-        try:
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(IA_TIMEOUT_SECONDES)
-        except (AttributeError, OSError):
-            pass  # Windows ne supporte pas SIGALRM
+        # signal.alarm non utilisé (incompatible avec les threads FastAPI)
 
         response = claude_client.messages.create(
             model="claude-haiku-4-5",
@@ -226,10 +221,7 @@ Ne réponds qu'avec le JSON, aucun texte autour."""
             messages=[{"role": "user", "content": prompt}]
         )
 
-        try:
-            signal.alarm(0)  # Annuler le timeout
-        except (AttributeError, OSError):
-            pass
+        # (timeout annulé automatiquement)
 
         texte = response.content[0].text.strip()
         # Nettoyer les backticks éventuels
@@ -1003,8 +995,15 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
             type_op = "RETRAIT"  # SIM a augmenté → merchant a reçu mobile → donné cash
             dp = -amount; dv = +amount
         else:
-            logger.info("⏭ Delta SIM = 0 → pas de maj cash")
-            return
+            # Solde identique (même SMS reçu 2 fois ou SMS sans changement de solde)
+            # → Fallback sur la raison pour ne pas bloquer la mise à jour cash
+            logger.info(f"💡 Delta SIM=0 → fallback raison={raison}")
+            if raison == "momo_depot":
+                type_op = "DEPOT";   dp = +amount; dv = -amount
+            elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
+                type_op = "RETRAIT"; dp = -amount; dv = +amount
+            else:
+                logger.info("⏭ raison inconnue → pas de maj cash"); return
         logger.info(f"💡 {type_op} détecté via solde SIM ({solde_ancien}→{solde_nouveau})")
     else:
         if raison == "momo_depot":
