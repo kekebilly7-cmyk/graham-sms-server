@@ -1056,8 +1056,8 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     # ── 4. Mettre à jour la session ───────────────────────────────
     try:
         res_upd = supabase_admin.table("cash_sessions").update({
-            "current_cash":    nouveau_p,
-            "current_virtuel": nouveau_v,
+            "current_cash":    int(nouveau_p),
+            "current_virtuel": int(nouveau_v),
         }).eq("id", sess_id).execute()
 
         nb_updated = len(res_upd.data) if res_upd.data else 0
