@@ -973,131 +973,105 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_nouveau: int = 0, solde_ancien: int = 0,
                      transaction_id: str = ""):
     """
-    Logique agent Mobile Money :
-      DEPOT  (client donne cash → merchant crédite SIM) :
-        physique +amount | virtuel -amount
-      RETRAIT (client retire cash ← merchant débite SIM) :
-        physique -amount | virtuel +amount
-
-    Détection par delta SIM en priorité, fallback sur raison.
+    Règle simple :
+      solde SIM monte  → RETRAIT → client prend cash → cash physique DIMINUE
+      solde SIM baisse → DEPOT   → client donne cash → cash physique AUGMENTE
     """
     if amount <= 0:
-        logger.info(f"⏭ Cash ignoré — amount={amount}")
-        return
+        logger.info(f"⏭ amount={amount} → ignoré"); return
 
-    # ── 1. Déterminer le type ────────────────────────────────────
+    # ── Étape 1 : déterminer l'effet sur le cash ──────────────────
     if solde_nouveau > 0 and solde_ancien > 0:
-        delta_sim = solde_nouveau - solde_ancien
-        if delta_sim < 0:
-            type_op = "DEPOT"    # SIM a diminué → merchant a envoyé mobile → reçu cash
-            dp = +amount; dv = -amount
-        elif delta_sim > 0:
-            type_op = "RETRAIT"  # SIM a augmenté → merchant a reçu mobile → donné cash
-            dp = -amount; dv = +amount
+        if solde_nouveau > solde_ancien:
+            effet = -amount          # SIM ↑ → RETRAIT → cash ↓
+            type_op = "RETRAIT"
+            logger.info(f"📉 Solde SIM {solde_ancien}→{solde_nouveau} (+{solde_nouveau-solde_ancien}) = RETRAIT → cash -{amount}F")
+        elif solde_nouveau < solde_ancien:
+            effet = +amount          # SIM ↓ → DEPOT → cash ↑
+            type_op = "DEPOT"
+            logger.info(f"📈 Solde SIM {solde_ancien}→{solde_nouveau} (-{solde_ancien-solde_nouveau}) = DEPOT → cash +{amount}F")
         else:
-            # Solde identique (même SMS reçu 2 fois ou SMS sans changement de solde)
-            # → Fallback sur la raison pour ne pas bloquer la mise à jour cash
-            logger.info(f"💡 Delta SIM=0 → fallback raison={raison}")
+            # Même solde → raison comme fallback
             if raison == "momo_depot":
-                type_op = "DEPOT";   dp = +amount; dv = -amount
-            elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-                type_op = "RETRAIT"; dp = -amount; dv = +amount
+                effet = +amount; type_op = "DEPOT"
             else:
-                logger.info("⏭ raison inconnue → pas de maj cash"); return
-        logger.info(f"💡 {type_op} détecté via solde SIM ({solde_ancien}→{solde_nouveau})")
+                effet = -amount; type_op = "RETRAIT"
+            logger.info(f"⚠ Solde identique → fallback raison={raison} → cash {effet:+}F")
     else:
+        # Pas de solde → raison
         if raison == "momo_depot":
-            type_op = "DEPOT";   dp = +amount; dv = -amount
+            effet = +amount; type_op = "DEPOT"
         elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-            type_op = "RETRAIT"; dp = -amount; dv = +amount
+            effet = -amount; type_op = "RETRAIT"
         else:
-            logger.info(f"⏭ raison={raison} — pas de maj cash")
-            return
-        logger.info(f"💡 {type_op} détecté via raison={raison}")
+            logger.info(f"⏭ raison={raison} sans solde → ignoré"); return
+        logger.info(f"💡 Fallback raison={raison} → cash {effet:+}F")
 
-    # ── 2. Vérifier réseau ON ─────────────────────────────────────
+    # ── Étape 2 : vérifier réseau ON ─────────────────────────────
     if not reseau_est_actif(account_id):
-        logger.info(f"⏭ Réseau {account_id} OFF"); return
+        logger.info(f"⏭ Réseau OFF"); return
 
-    # ── 3. Chercher la session active (sans vérification de date stricte) ─
+    # ── Étape 3 : lire la session active ─────────────────────────
     try:
-        res = supabase_admin.table("cash_sessions").select("*") \
+        res = supabase_admin.table("cash_sessions").select("id,current_cash,opening_cash,current_virtuel") \
                       .eq("account_id", account_id) \
                       .eq("actif", True) \
                       .gt("opening_cash", 0) \
                       .order("created_at", desc=True) \
                       .limit(1).execute()
+        if not res.data:
+            logger.warning("⏭ Aucune session active (opening_cash>0 ET actif=true)")
+            return
+        sess = res.data[0]
     except Exception as e:
         logger.error(f"Erreur lecture session: {e}"); return
 
-    if not res.data:
-        logger.info("⏭ Aucune session active — saisir cash départ dans Mobile Money System")
-        return
+    sess_id   = sess["id"]
+    cash_avant = int(float(sess.get("current_cash") or sess.get("opening_cash") or 0))
+    cash_apres = max(0, cash_avant + effet)
+    virt_avant = int(float(sess.get("current_virtuel") or 0))
+    virt_apres = int(solde_nouveau) if solde_nouveau > 0 else virt_avant
 
-    sess = res.data[0]
-    sess_id = sess["id"]
-
-    # Cash physique
-    current_p = float(sess.get("current_cash") or sess.get("opening_cash") or 0)
-    nouveau_p = max(0.0, current_p + dp)
-
-    # Cash virtuel
-    current_v = float(sess.get("current_virtuel") or sess.get("opening_virtuel") or 0)
-    if current_v == 0 and solde_ancien > 0:
-        current_v = float(solde_ancien)
-    nouveau_v = float(solde_nouveau) if solde_nouveau > 0 else max(0.0, current_v + dv)
-
-    logger.info(
-        f"💵 {type_op} {amount}F | "
-        f"Physique: {current_p:.0f}→{nouveau_p:.0f} | "
-        f"Virtuel: {current_v:.0f}→{nouveau_v:.0f}"
-    )
-
-    # ── 4. Mettre à jour la session ───────────────────────────────
+    # ── Étape 4 : mettre à jour la session ───────────────────────
     try:
-        res_upd = supabase_admin.table("cash_sessions").update({
-            "current_cash":    int(nouveau_p),
-            "current_virtuel": int(nouveau_v),
+        upd = supabase_admin.table("cash_sessions").update({
+            "current_cash":    cash_apres,
+            "current_virtuel": virt_apres,
         }).eq("id", sess_id).execute()
 
-        nb_updated = len(res_upd.data) if res_upd.data else 0
-        if nb_updated > 0:
-            logger.info(f"✅ Session {sess_id} mise à jour : cash {current_p:.0f}→{nouveau_p:.0f}F")
+        nb = len(upd.data) if upd.data else 0
+        if nb > 0:
+            logger.info(f"✅ {type_op} {amount}F | Cash: {cash_avant}→{cash_apres}F | Session {sess_id}")
         else:
-            logger.error(f"❌ UPDATE session échoué (0 lignes) — RLS encore actif ? session_id={sess_id}")
-            # Tentative avec supabase normal en fallback
-            supabase.table("cash_sessions").update({
-                "current_cash":    nouveau_p,
-                "current_virtuel": nouveau_v,
-            }).eq("id", sess_id).execute()
-            logger.info(f"✅ Fallback supabase anon — cash mis à jour")
+            logger.error(f"❌ UPDATE 0 lignes — session_id={sess_id} (RLS ? mauvais id ?)")
     except Exception as e:
-        logger.error(f"Erreur update session cash: {e}"); return
+        logger.error(f"❌ UPDATE session crash: {e}"); return
 
-    # ── 5. Enregistrer mouvement immuable ─────────────────────────
-    mv_base = {
-        "account_id": account_id,
-        "amount":     dp,
-        "type":       type_op,
-        "cash_apres": nouveau_p,
-    }
-    mv_ext = {
+    # ── Étape 5 : mouvement immuable ─────────────────────────────
+    mv = {
+        "account_id":       account_id,
+        "amount":           effet,
+        "type":             type_op,
+        "cash_apres":       cash_apres,
         "type_operation":   type_op,
-        "ancien_physique":  current_p,
-        "nouveau_physique": nouveau_p,
-        "ancien_virtuel":   current_v,
-        "nouveau_virtuel":  nouveau_v,
+        "ancien_physique":  cash_avant,
+        "nouveau_physique": cash_apres,
+        "ancien_virtuel":   virt_avant,
+        "nouveau_virtuel":  virt_apres,
     }
     if transaction_id:
-        mv_base["transaction_id"] = transaction_id
+        mv["transaction_id"] = transaction_id
     try:
-        supabase_admin.table("cash_movements").insert({**mv_base, **mv_ext}).execute()
+        supabase_admin.table("cash_movements").insert(mv).execute()
     except Exception:
         try:
-            supabase_admin.table("cash_movements").insert(mv_base).execute()
+            supabase_admin.table("cash_movements").insert({
+                "account_id": account_id, "amount": effet,
+                "type": type_op, "cash_apres": cash_apres,
+                "transaction_id": transaction_id or None
+            }).execute()
         except Exception as e2:
-            logger.error(f"Erreur insert mouvement: {e2}")
-
+            logger.error(f"Erreur mouvement: {e2}")
 
 def _detecter_operateur(sender: str, body: str) -> str:
     """Détecte l'opérateur Mobile Money depuis l'expéditeur et le corps du SMS."""
