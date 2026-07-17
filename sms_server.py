@@ -72,7 +72,7 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_
 app = FastAPI(
     title="Graham SMS Server",
     description="Serveur de réception SMS Mobile Money — Graham POS / Tracker Android",
-    version="2.0.0"
+    version="2.0.1"
 )
 
 app.add_middleware(
@@ -415,7 +415,7 @@ def health_check():
     return {
         "status":    "ok",
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "version":   "2.0.0",
+        "version":   "2.0.1",
         "ia_active": claude_client is not None
     }
 
@@ -954,6 +954,35 @@ def lister_pending(account_id: int = 0):
 # ════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES INTERNES
 # ════════════════════════════════════════════════════════════════════════════
+
+def reseau_est_actif(account_id: int) -> bool:
+    """
+    ── FIX ──────────────────────────────────────────────────────────────────
+    Cette fonction était APPELÉE par maj_current_cash() mais n'était jamais
+    DÉFINIE nulle part dans le fichier. Chaque appel provoquait un NameError,
+    silencieusement avalé par le try/except dans recevoir_sms() — résultat :
+    le cash physique n'était JAMAIS mis à jour par les transactions SMS,
+    même si elles étaient bien enregistrées dans la table `transactions`.
+    ──────────────────────────────────────────────────────────────────────────
+
+    Vérifie si le réseau (compte) est actif, en lisant le champ `actif`
+    de la dernière session cash_sessions pour ce compte.
+    Retourne True si aucune session n'existe encore (ouvert par défaut),
+    ou si `actif` n'est pas explicitement False.
+    """
+    try:
+        res = supabase_admin.table("cash_sessions").select("actif") \
+                            .eq("account_id", account_id) \
+                            .gt("opening_cash", 0) \
+                            .order("created_at", desc=True) \
+                            .limit(1).execute()
+        if res.data:
+            return res.data[0].get("actif", True) is not False
+        return True  # Pas de session = réseau ouvert par défaut
+    except Exception as e:
+        logger.error(f"⛔ Erreur reseau_est_actif(account_id={account_id}): {e}")
+        # En cas d'erreur de lecture, on ne bloque pas la mise à jour du cash
+        return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
