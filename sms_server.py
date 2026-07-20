@@ -651,8 +651,17 @@ def recevoir_sms(
     solde     = int(parsed.get("solde",        0))
     frais     = int(parsed.get("frais",        0))
 
-    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
-             else "confirmed"
+    # ── FIX ──────────────────────────────────────────────────────────────
+    # Avant : le statut "pending" n'était déclenché QUE si source == "ia".
+    # Quand l'IA échoue/timeout, source devient "regex" — et le regex fixe
+    # lui-même une confiance basse (0.60) pour les messages qu'il ne
+    # reconnaît pas ("message bizarre"), mais cette confiance était
+    # totalement ignorée puisque source != "ia". Résultat : un SMS
+    # ambigu passé par le fallback regex était TOUJOURS "confirmed"
+    # immédiatement, et le cash se mettait à jour sans validation humaine.
+    # Maintenant on vérifie la confiance quelle que soit la source.
+    # ───────────────────────────────────────────────────────────────────
+    statut = "pending" if confiance < SEUIL_CONFIANCE_IA else "confirmed"
 
     operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
