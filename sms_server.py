@@ -795,10 +795,24 @@ def confirmer_transaction(
 ):
     """
     Confirme manuellement une transaction en statut 'pending'.
-    Appelé depuis Graham POS quand le caissier choisit le bon type.
+    Appelé depuis Graham POS quand le caissier choisit le bon type
+    (ou clique "Ignorer").
 
-    Cette fonction existait dans la version précédente — conservée et
-    étendue pour mettre à jour aussi sim_label si disponible.
+    ── FIX ──────────────────────────────────────────────────────────────
+    Avant, cette fonction ne faisait que changer raison/statut en base et
+    n'appelait JAMAIS transaction_engine() — une transaction confirmée
+    manuellement n'avait donc aucun impact sur le cash.
+    Maintenant :
+      - Si le caissier choisit un vrai type (dépôt/retrait/transfert/...)
+        → on appelle transaction_engine() à CE moment précis. C'est le
+        SEUL moment où le cash bouge pour une transaction qui était
+        "pending" — jamais avant la décision humaine.
+      - Si le caissier clique "Ignorer" (raison == "ignored")
+        → statut passe à "confirmed" (elle s'affiche "✅ OK") mais on ne
+        touche NI au cash NI au solde. raison="ignored" ne correspond à
+        aucun filtre momo_* utilisé ailleurs (totaux SIM, synchronisation
+        cash côté PC), donc elle reste sans aucun effet, nulle part.
+    ────────────────────────────────────────────────────────────────────
     """
     raisons_valides = {
         "momo_depot", "momo_retrait", "momo_transfert",
@@ -810,7 +824,21 @@ def confirmer_transaction(
             detail=f"Raison invalide. Valeurs acceptées : {raisons_valides}"
         )
 
-    nouveau_statut = "confirmed" if payload.raison != "ignored" else "ignored"
+    # Lire la transaction AVANT de la modifier — on a besoin de son
+    # montant, de son solde SIM et de son account_id pour calculer l'impact.
+    try:
+        res_tx = supabase.table("transactions").select("*") \
+                         .eq("id", transaction_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not res_tx.data:
+        raise HTTPException(status_code=404, detail="Transaction introuvable")
+    tx = res_tx.data[0]
+
+    # Une décision humaine a été prise → statut devient "confirmed" dans
+    # tous les cas (y compris "Ignorer" : la transaction n'est plus en
+    # attente, elle apparaît juste sans impact cash).
+    nouveau_statut = "confirmed"
 
     try:
         res = supabase.table("transactions").update({
@@ -823,13 +851,54 @@ def confirmer_transaction(
     if not res.data:
         raise HTTPException(status_code=404, detail="Transaction introuvable")
 
-    logger.info(f"✅ Transaction #{transaction_id} confirmée: {payload.raison}")
+    # ── Impact cash — uniquement si ce n'est PAS "Ignorer" ─────────────
+    impact_cash = False
+    if payload.raison != "ignored":
+        amount        = int(tx.get("amount", 0) or 0)
+        account_id    = int(tx.get("account_id", 1) or 1)
+        solde_nouveau = int(tx.get("solde", 0) or 0)
+
+        # Chercher le solde SIM juste avant cette transaction (pour le
+        # calcul du delta, comme le fait recevoir_sms()).
+        solde_ancien = 0
+        try:
+            res_prev = supabase.table("transactions") \
+                               .select("solde") \
+                               .eq("account_id", account_id) \
+                               .not_.is_("solde", "null") \
+                               .gt("solde", 0) \
+                               .lt("created_at", tx.get("created_at", "")) \
+                               .order("created_at", desc=True) \
+                               .limit(1).execute()
+            if res_prev.data:
+                solde_ancien = int(res_prev.data[0].get("solde") or 0)
+        except Exception as e:
+            logger.warning(f"Impossible de lire le solde précédent (confirmation manuelle): {e}")
+
+        if amount > 0:
+            try:
+                impact_cash = maj_current_cash(
+                    account_id      = account_id,
+                    amount          = amount,
+                    raison          = payload.raison,
+                    solde_nouveau   = solde_nouveau,
+                    solde_ancien    = solde_ancien,
+                    transaction_id  = str(transaction_id),
+                )
+            except Exception as e:
+                logger.error(f"Erreur maj cash (confirmation manuelle #{transaction_id}): {e}")
+
+    logger.info(
+        f"✅ Transaction #{transaction_id} confirmée manuellement: "
+        f"{payload.raison} (impact_cash={impact_cash})"
+    )
     return {
-        "status":  "ok",
-        "id":      transaction_id,
-        "raison":  payload.raison,
-        "statut":  nouveau_statut,
-        "message": "Transaction confirmée"
+        "status":      "ok",
+        "id":          transaction_id,
+        "raison":      payload.raison,
+        "statut":      nouveau_statut,
+        "impact_cash": impact_cash,
+        "message":     "Transaction confirmée"
     }
 
 
