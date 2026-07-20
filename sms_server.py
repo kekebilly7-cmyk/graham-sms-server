@@ -72,7 +72,7 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_
 app = FastAPI(
     title="Graham SMS Server",
     description="Serveur de réception SMS Mobile Money — Graham POS / Tracker Android",
-    version="2.0.1"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -415,7 +415,7 @@ def health_check():
     return {
         "status":    "ok",
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "version":   "2.0.1",
+        "version":   "2.0.0",
         "ia_active": claude_client is not None
     }
 
@@ -651,17 +651,8 @@ def recevoir_sms(
     solde     = int(parsed.get("solde",        0))
     frais     = int(parsed.get("frais",        0))
 
-    # ── FIX ──────────────────────────────────────────────────────────────
-    # Avant : le statut "pending" n'était déclenché QUE si source == "ia".
-    # Quand l'IA échoue/timeout, source devient "regex" — et le regex fixe
-    # lui-même une confiance basse (0.60) pour les messages qu'il ne
-    # reconnaît pas ("message bizarre"), mais cette confiance était
-    # totalement ignorée puisque source != "ia". Résultat : un SMS
-    # ambigu passé par le fallback regex était TOUJOURS "confirmed"
-    # immédiatement, et le cash se mettait à jour sans validation humaine.
-    # Maintenant on vérifie la confiance quelle que soit la source.
-    # ───────────────────────────────────────────────────────────────────
-    statut = "pending" if confiance < SEUIL_CONFIANCE_IA else "confirmed"
+    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
+             else "confirmed"
 
     operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
@@ -804,24 +795,10 @@ def confirmer_transaction(
 ):
     """
     Confirme manuellement une transaction en statut 'pending'.
-    Appelé depuis Graham POS quand le caissier choisit le bon type
-    (ou clique "Ignorer").
+    Appelé depuis Graham POS quand le caissier choisit le bon type.
 
-    ── FIX ──────────────────────────────────────────────────────────────
-    Avant, cette fonction ne faisait que changer raison/statut en base et
-    n'appelait JAMAIS transaction_engine() — une transaction confirmée
-    manuellement n'avait donc aucun impact sur le cash.
-    Maintenant :
-      - Si le caissier choisit un vrai type (dépôt/retrait/transfert/...)
-        → on appelle transaction_engine() à CE moment précis. C'est le
-        SEUL moment où le cash bouge pour une transaction qui était
-        "pending" — jamais avant la décision humaine.
-      - Si le caissier clique "Ignorer" (raison == "ignored")
-        → statut passe à "confirmed" (elle s'affiche "✅ OK") mais on ne
-        touche NI au cash NI au solde. raison="ignored" ne correspond à
-        aucun filtre momo_* utilisé ailleurs (totaux SIM, synchronisation
-        cash côté PC), donc elle reste sans aucun effet, nulle part.
-    ────────────────────────────────────────────────────────────────────
+    Cette fonction existait dans la version précédente — conservée et
+    étendue pour mettre à jour aussi sim_label si disponible.
     """
     raisons_valides = {
         "momo_depot", "momo_retrait", "momo_transfert",
@@ -833,21 +810,7 @@ def confirmer_transaction(
             detail=f"Raison invalide. Valeurs acceptées : {raisons_valides}"
         )
 
-    # Lire la transaction AVANT de la modifier — on a besoin de son
-    # montant, de son solde SIM et de son account_id pour calculer l'impact.
-    try:
-        res_tx = supabase.table("transactions").select("*") \
-                         .eq("id", transaction_id).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not res_tx.data:
-        raise HTTPException(status_code=404, detail="Transaction introuvable")
-    tx = res_tx.data[0]
-
-    # Une décision humaine a été prise → statut devient "confirmed" dans
-    # tous les cas (y compris "Ignorer" : la transaction n'est plus en
-    # attente, elle apparaît juste sans impact cash).
-    nouveau_statut = "confirmed"
+    nouveau_statut = "confirmed" if payload.raison != "ignored" else "ignored"
 
     try:
         res = supabase.table("transactions").update({
@@ -860,54 +823,13 @@ def confirmer_transaction(
     if not res.data:
         raise HTTPException(status_code=404, detail="Transaction introuvable")
 
-    # ── Impact cash — uniquement si ce n'est PAS "Ignorer" ─────────────
-    impact_cash = False
-    if payload.raison != "ignored":
-        amount        = int(tx.get("amount", 0) or 0)
-        account_id    = int(tx.get("account_id", 1) or 1)
-        solde_nouveau = int(tx.get("solde", 0) or 0)
-
-        # Chercher le solde SIM juste avant cette transaction (pour le
-        # calcul du delta, comme le fait recevoir_sms()).
-        solde_ancien = 0
-        try:
-            res_prev = supabase.table("transactions") \
-                               .select("solde") \
-                               .eq("account_id", account_id) \
-                               .not_.is_("solde", "null") \
-                               .gt("solde", 0) \
-                               .lt("created_at", tx.get("created_at", "")) \
-                               .order("created_at", desc=True) \
-                               .limit(1).execute()
-            if res_prev.data:
-                solde_ancien = int(res_prev.data[0].get("solde") or 0)
-        except Exception as e:
-            logger.warning(f"Impossible de lire le solde précédent (confirmation manuelle): {e}")
-
-        if amount > 0:
-            try:
-                impact_cash = maj_current_cash(
-                    account_id      = account_id,
-                    amount          = amount,
-                    raison          = payload.raison,
-                    solde_nouveau   = solde_nouveau,
-                    solde_ancien    = solde_ancien,
-                    transaction_id  = str(transaction_id),
-                )
-            except Exception as e:
-                logger.error(f"Erreur maj cash (confirmation manuelle #{transaction_id}): {e}")
-
-    logger.info(
-        f"✅ Transaction #{transaction_id} confirmée manuellement: "
-        f"{payload.raison} (impact_cash={impact_cash})"
-    )
+    logger.info(f"✅ Transaction #{transaction_id} confirmée: {payload.raison}")
     return {
-        "status":      "ok",
-        "id":          transaction_id,
-        "raison":      payload.raison,
-        "statut":      nouveau_statut,
-        "impact_cash": impact_cash,
-        "message":     "Transaction confirmée"
+        "status":  "ok",
+        "id":      transaction_id,
+        "raison":  payload.raison,
+        "statut":  nouveau_statut,
+        "message": "Transaction confirmée"
     }
 
 
@@ -951,12 +873,11 @@ def debug_cash(account_id: int):
     }
 
 
-@app.post("/api/test/cash")
+@app.get("/api/test/cash")
 def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT"):
     """
-    Test direct de transaction_engine.
-    type_op: DEPOT ou RETRAIT
-    Exemple: POST /api/test/cash?account_id=1&amount=5000&type_op=DEPOT
+    Test direct de transaction_engine — accessible depuis le navigateur.
+    Exemple: https://graham-sms-server.onrender.com/api/test/cash?account_id=1&amount=5000&type_op=DEPOT
     """
     ok = transaction_engine(
         account_id     = account_id,
@@ -965,14 +886,15 @@ def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT
         transaction_id = "TEST_MANUEL"
     )
     return {
-        "status":       "✅ succès" if ok else "❌ échec",
-        "type_op":      type_op,
-        "amount":       amount,
-        "account_id":   account_id,
-        "instruction":  "Voir les logs Render pour le détail",
+        "status":     "✅ succès" if ok else "❌ échec",
+        "type_op":    type_op,
+        "amount":     amount,
+        "account_id": account_id,
+        "message":    "Vérifier les logs Render et la table cash_sessions dans Supabase",
     }
 
 
+@app.get("/api/debug/code/{code}")
 def debug_code(code: str):
     """
     Endpoint de diagnostic — vérifie si un code existe dans mm_profiles.
@@ -1011,6 +933,7 @@ def debug_code(code: str):
 
 
 
+@app.get("/api/pending")
 def lister_pending(account_id: int = 0):
     """
     Retourne les transactions en attente de confirmation manuelle.
@@ -1032,35 +955,6 @@ def lister_pending(account_id: int = 0):
 # ════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES INTERNES
 # ════════════════════════════════════════════════════════════════════════════
-
-def reseau_est_actif(account_id: int) -> bool:
-    """
-    ── FIX ──────────────────────────────────────────────────────────────────
-    Cette fonction était APPELÉE par maj_current_cash() mais n'était jamais
-    DÉFINIE nulle part dans le fichier. Chaque appel provoquait un NameError,
-    silencieusement avalé par le try/except dans recevoir_sms() — résultat :
-    le cash physique n'était JAMAIS mis à jour par les transactions SMS,
-    même si elles étaient bien enregistrées dans la table `transactions`.
-    ──────────────────────────────────────────────────────────────────────────
-
-    Vérifie si le réseau (compte) est actif, en lisant le champ `actif`
-    de la dernière session cash_sessions pour ce compte.
-    Retourne True si aucune session n'existe encore (ouvert par défaut),
-    ou si `actif` n'est pas explicitement False.
-    """
-    try:
-        res = supabase_admin.table("cash_sessions").select("actif") \
-                            .eq("account_id", account_id) \
-                            .gt("opening_cash", 0) \
-                            .order("created_at", desc=True) \
-                            .limit(1).execute()
-        if res.data:
-            return res.data[0].get("actif", True) is not False
-        return True  # Pas de session = réseau ouvert par défaut
-    except Exception as e:
-        logger.error(f"⛔ Erreur reseau_est_actif(account_id={account_id}): {e}")
-        # En cas d'erreur de lecture, on ne bloque pas la mise à jour du cash
-        return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
