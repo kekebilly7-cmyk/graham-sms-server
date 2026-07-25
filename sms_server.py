@@ -651,8 +651,17 @@ def recevoir_sms(
     solde     = int(parsed.get("solde",        0))
     frais     = int(parsed.get("frais",        0))
 
-    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
-             else "confirmed"
+    # ── FIX ──────────────────────────────────────────────────────────────
+    # Avant : le statut "pending" n'était déclenché QUE si source == "ia".
+    # Quand l'IA échoue/timeout, source devient "regex" — et le regex fixe
+    # lui-même une confiance basse (0.60) pour les messages qu'il ne
+    # reconnaît pas ("message bizarre"), mais cette confiance était
+    # totalement ignorée puisque source != "ia". Résultat : un SMS
+    # ambigu passé par le fallback regex était TOUJOURS "confirmed"
+    # immédiatement, et le cash se mettait à jour sans validation humaine.
+    # Maintenant on vérifie la confiance quelle que soit la source.
+    # ───────────────────────────────────────────────────────────────────
+    statut = "pending" if confiance < SEUIL_CONFIANCE_IA else "confirmed"
 
     operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
@@ -795,10 +804,24 @@ def confirmer_transaction(
 ):
     """
     Confirme manuellement une transaction en statut 'pending'.
-    Appelé depuis Graham POS quand le caissier choisit le bon type.
+    Appelé depuis Graham POS quand le caissier choisit le bon type
+    (ou clique "Ignorer").
 
-    Cette fonction existait dans la version précédente — conservée et
-    étendue pour mettre à jour aussi sim_label si disponible.
+    ── FIX ──────────────────────────────────────────────────────────────
+    Avant, cette fonction ne faisait que changer raison/statut en base et
+    n'appelait JAMAIS transaction_engine() — une transaction confirmée
+    manuellement n'avait donc aucun impact sur le cash.
+    Maintenant :
+      - Si le caissier choisit un vrai type (dépôt/retrait/transfert/...)
+        → on appelle transaction_engine() à CE moment précis. C'est le
+        SEUL moment où le cash bouge pour une transaction qui était
+        "pending" — jamais avant la décision humaine.
+      - Si le caissier clique "Ignorer" (raison == "ignored")
+        → statut passe à "confirmed" (elle s'affiche "✅ OK") mais on ne
+        touche NI au cash NI au solde. raison="ignored" ne correspond à
+        aucun filtre momo_* utilisé ailleurs (totaux SIM, synchronisation
+        cash côté PC), donc elle reste sans aucun effet, nulle part.
+    ────────────────────────────────────────────────────────────────────
     """
     raisons_valides = {
         "momo_depot", "momo_retrait", "momo_transfert",
@@ -810,7 +833,21 @@ def confirmer_transaction(
             detail=f"Raison invalide. Valeurs acceptées : {raisons_valides}"
         )
 
-    nouveau_statut = "confirmed" if payload.raison != "ignored" else "ignored"
+    # Lire la transaction AVANT de la modifier — on a besoin de son
+    # montant, de son solde SIM et de son account_id pour calculer l'impact.
+    try:
+        res_tx = supabase.table("transactions").select("*") \
+                         .eq("id", transaction_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not res_tx.data:
+        raise HTTPException(status_code=404, detail="Transaction introuvable")
+    tx = res_tx.data[0]
+
+    # Une décision humaine a été prise → statut devient "confirmed" dans
+    # tous les cas (y compris "Ignorer" : la transaction n'est plus en
+    # attente, elle apparaît juste sans impact cash).
+    nouveau_statut = "confirmed"
 
     try:
         res = supabase.table("transactions").update({
@@ -823,13 +860,54 @@ def confirmer_transaction(
     if not res.data:
         raise HTTPException(status_code=404, detail="Transaction introuvable")
 
-    logger.info(f"✅ Transaction #{transaction_id} confirmée: {payload.raison}")
+    # ── Impact cash — uniquement si ce n'est PAS "Ignorer" ─────────────
+    impact_cash = False
+    if payload.raison != "ignored":
+        amount        = int(tx.get("amount", 0) or 0)
+        account_id    = int(tx.get("account_id", 1) or 1)
+        solde_nouveau = int(tx.get("solde", 0) or 0)
+
+        # Chercher le solde SIM juste avant cette transaction (pour le
+        # calcul du delta, comme le fait recevoir_sms()).
+        solde_ancien = 0
+        try:
+            res_prev = supabase.table("transactions") \
+                               .select("solde") \
+                               .eq("account_id", account_id) \
+                               .not_.is_("solde", "null") \
+                               .gt("solde", 0) \
+                               .lt("created_at", tx.get("created_at", "")) \
+                               .order("created_at", desc=True) \
+                               .limit(1).execute()
+            if res_prev.data:
+                solde_ancien = int(res_prev.data[0].get("solde") or 0)
+        except Exception as e:
+            logger.warning(f"Impossible de lire le solde précédent (confirmation manuelle): {e}")
+
+        if amount > 0:
+            try:
+                impact_cash = maj_current_cash(
+                    account_id      = account_id,
+                    amount          = amount,
+                    raison          = payload.raison,
+                    solde_nouveau   = solde_nouveau,
+                    solde_ancien    = solde_ancien,
+                    transaction_id  = str(transaction_id),
+                )
+            except Exception as e:
+                logger.error(f"Erreur maj cash (confirmation manuelle #{transaction_id}): {e}")
+
+    logger.info(
+        f"✅ Transaction #{transaction_id} confirmée manuellement: "
+        f"{payload.raison} (impact_cash={impact_cash})"
+    )
     return {
-        "status":  "ok",
-        "id":      transaction_id,
-        "raison":  payload.raison,
-        "statut":  nouveau_statut,
-        "message": "Transaction confirmée"
+        "status":      "ok",
+        "id":          transaction_id,
+        "raison":      payload.raison,
+        "statut":      nouveau_statut,
+        "impact_cash": impact_cash,
+        "message":     "Transaction confirmée"
     }
 
 
@@ -955,6 +1033,30 @@ def lister_pending(account_id: int = 0):
 # UTILITAIRES INTERNES
 # ════════════════════════════════════════════════════════════════════════════
 
+def session_est_du_jour(created_at_str) -> bool:
+    """
+    ── FIX reset 24h ────────────────────────────────────────────────────────
+    Vérifie si une session cash_sessions a été créée aujourd'hui (fuseau
+    Paris, offset fixe +2h — même convention que le reste du fichier).
+    Une session d'un jour précédent est considérée périmée : le cash départ
+    doit être ressaisi chaque nouvelle journée avant que les SMS ne
+    recommencent à impacter le cash physique/virtuel.
+    """
+    if not created_at_str:
+        return False
+    try:
+        s = str(created_at_str).replace("Z", "+00:00")
+        dt_utc = datetime.datetime.fromisoformat(s)
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+        paris_tz = datetime.timezone(datetime.timedelta(hours=2))
+        dt_paris = dt_utc.astimezone(paris_tz)
+        aujourd_hui_paris = datetime.datetime.now(paris_tz).date()
+        return dt_paris.date() == aujourd_hui_paris
+    except Exception:
+        return False
+
+
 def reseau_est_actif(account_id: int) -> bool:
     """
     ── FIX ──────────────────────────────────────────────────────────────────
@@ -1021,7 +1123,7 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
     # ── Lire la session active ─────────────────────────────────────
     try:
         res = supabase_admin.table("cash_sessions").select(
-            "id,current_cash,opening_cash,current_virtuel,opening_virtuel"
+            "id,current_cash,opening_cash,current_virtuel,opening_virtuel,created_at"
         ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0) \
          .order("created_at", desc=True).limit(1).execute()
 
@@ -1033,6 +1135,21 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
         return False
 
     sess      = res.data[0]
+
+    # ── FIX reset 24h ────────────────────────────────────────────────
+    # Une session créée un jour précédent (fuseau Paris) est considérée
+    # périmée : le cash départ doit être ressaisi chaque jour côté PC avant
+    # que les SMS ne recommencent à impacter le cash. La transaction reste
+    # bien enregistrée dans `transactions` (recevoir_sms s'en charge avant
+    # d'appeler cette fonction) — seul l'impact sur le cash est bloqué ici.
+    if not session_est_du_jour(sess.get("created_at")):
+        logger.info(
+            f"⏭ transaction_engine: session du {sess.get('created_at')} "
+            f"périmée (pas d'aujourd'hui) → cash non mis à jour, "
+            f"en attente de ressaisie du cash départ (account_id={account_id})"
+        )
+        return False
+
     sess_id   = sess["id"]
 
     # Valeurs actuelles
