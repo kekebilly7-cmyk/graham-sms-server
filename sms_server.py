@@ -420,6 +420,45 @@ def health_check():
     }
 
 
+@app.get("/api/debug/env")
+def debug_env():
+    """
+    Diagnostic : vérifie SANS RIEN EXPOSER DE SECRET si SUPABASE_SERVICE_KEY
+    est bien chargée par Render, si elle diffère de la clé anonyme, et si
+    elle a bien la forme d'une clé service_role (via son contenu JWT décodé,
+    sans vérifier la signature — juste pour lire le champ "role").
+    """
+    import base64
+
+    def decoder_role_jwt(jwt_token: str):
+        try:
+            partie_payload = jwt_token.split(".")[1]
+            partie_payload += "=" * (-len(partie_payload) % 4)  # padding
+            payload = json.loads(base64.urlsafe_b64decode(partie_payload))
+            return payload.get("role")
+        except Exception:
+            return None
+
+    service_key_definie = bool(SUPABASE_SERVICE_KEY)
+    anon_key_definie     = bool(SUPABASE_KEY)
+    cle_effectivement_utilisee = SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
+
+    return {
+        "SUPABASE_SERVICE_KEY_definie": service_key_definie,
+        "SUPABASE_SERVICE_KEY_longueur": len(SUPABASE_SERVICE_KEY) if service_key_definie else 0,
+        "SUPABASE_KEY_definie":         anon_key_definie,
+        "role_dans_la_cle_admin_utilisee": decoder_role_jwt(cle_effectivement_utilisee),
+        "les_deux_cles_sont_identiques": (SUPABASE_KEY == SUPABASE_SERVICE_KEY) if (service_key_definie and anon_key_definie) else None,
+        "message": (
+            "✅ La clé admin utilisée a bien le rôle 'service_role'"
+            if decoder_role_jwt(cle_effectivement_utilisee) == "service_role"
+            else "❌ La clé admin utilisée N'A PAS le rôle service_role — "
+                 "SUPABASE_SERVICE_KEY est absente/vide sur Render, ou "
+                 "contient en réalité la clé anon."
+        ),
+    }
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # ACTIVATION / DISSOCIATION — app Android Tracker
 # ────────────────────────────────────────────────────────────────────────────
