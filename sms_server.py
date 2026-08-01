@@ -627,7 +627,7 @@ def recevoir_sms(
     ).hexdigest()
 
     try:
-        existing = supabase.table("transactions") \
+        existing = supabase_admin.table("transactions") \
                            .select("id") \
                            .eq("device_id", device_id) \
                            .eq("sms_hash",  sms_hash) \
@@ -710,12 +710,16 @@ def recevoir_sms(
                 f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
 
     # ── Récupérer le solde précédent AVANT l'insert (pour calcul delta) ──
+    # FIX multi-tenant : filtré par user_uuid, sinon deux marchands utilisant
+    # le même réseau (account_id identique) pourraient se voir mélanger leurs
+    # soldes SIM lors du calcul du delta DEPOT/RETRAIT.
     solde_precedent = 0
     if solde > 0:
         try:
-            res_prev = supabase.table("transactions") \
+            res_prev = supabase_admin.table("transactions") \
                                .select("solde") \
                                .eq("account_id", account_id) \
+                               .eq("user_uuid", user_uuid) \
                                .not_.is_("solde", "null") \
                                .gt("solde", 0) \
                                .order("created_at", desc=True) \
@@ -754,13 +758,13 @@ def recevoir_sms(
     }
 
     try:
-        res_ins = supabase.table("transactions").insert(
+        res_ins = supabase_admin.table("transactions").insert(
             {**insert_data, **optional_fields}
         ).execute()
     except Exception as e:
         logger.warning(f"Insert complet échoué ({e}) — tentative minimale")
         try:
-            res_ins = supabase.table("transactions").insert(insert_data).execute()
+            res_ins = supabase_admin.table("transactions").insert(insert_data).execute()
         except Exception as e2:
             logger.error(f"Erreur insertion: {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
@@ -777,7 +781,8 @@ def recevoir_sms(
                 raison          = raison,
                 solde_nouveau   = solde,
                 solde_ancien    = solde_precedent,
-                transaction_id  = tx_id_str
+                transaction_id  = tx_id_str,
+                user_uuid       = user_uuid,
             )
         except Exception as e_cash:
             logger.error(f"Erreur maj cash: {e_cash}")
@@ -836,7 +841,7 @@ def confirmer_transaction(
     # Lire la transaction AVANT de la modifier — on a besoin de son
     # montant, de son solde SIM et de son account_id pour calculer l'impact.
     try:
-        res_tx = supabase.table("transactions").select("*") \
+        res_tx = supabase_admin.table("transactions").select("*") \
                          .eq("id", transaction_id).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -850,7 +855,7 @@ def confirmer_transaction(
     nouveau_statut = "confirmed"
 
     try:
-        res = supabase.table("transactions").update({
+        res = supabase_admin.table("transactions").update({
             "raison":  payload.raison,
             "statut":  nouveau_statut,
         }).eq("id", transaction_id).execute()
@@ -866,19 +871,23 @@ def confirmer_transaction(
         amount        = int(tx.get("amount", 0) or 0)
         account_id    = int(tx.get("account_id", 1) or 1)
         solde_nouveau = int(tx.get("solde", 0) or 0)
+        user_uuid_tx  = tx.get("user_uuid")
 
         # Chercher le solde SIM juste avant cette transaction (pour le
         # calcul du delta, comme le fait recevoir_sms()).
+        # FIX multi-tenant : filtré aussi par user_uuid, sinon on pourrait
+        # lire le solde SIM d'un AUTRE marchand utilisant le même réseau.
         solde_ancien = 0
         try:
-            res_prev = supabase.table("transactions") \
+            q_prev = supabase_admin.table("transactions") \
                                .select("solde") \
                                .eq("account_id", account_id) \
                                .not_.is_("solde", "null") \
                                .gt("solde", 0) \
-                               .lt("created_at", tx.get("created_at", "")) \
-                               .order("created_at", desc=True) \
-                               .limit(1).execute()
+                               .lt("created_at", tx.get("created_at", ""))
+            if user_uuid_tx:
+                q_prev = q_prev.eq("user_uuid", user_uuid_tx)
+            res_prev = q_prev.order("created_at", desc=True).limit(1).execute()
             if res_prev.data:
                 solde_ancien = int(res_prev.data[0].get("solde") or 0)
         except Exception as e:
@@ -893,6 +902,7 @@ def confirmer_transaction(
                     solde_nouveau   = solde_nouveau,
                     solde_ancien    = solde_ancien,
                     transaction_id  = str(transaction_id),
+                    user_uuid       = user_uuid_tx,
                 )
             except Exception as e:
                 logger.error(f"Erreur maj cash (confirmation manuelle #{transaction_id}): {e}")
@@ -933,7 +943,7 @@ def debug_cash(account_id: int):
         session = None
 
     try:
-        mvs = supabase.table("cash_movements").select("*") \
+        mvs = supabase_admin.table("cash_movements").select("*") \
                       .eq("account_id", account_id) \
                       .order("created_at", desc=True) \
                       .limit(5).execute()
@@ -1017,7 +1027,7 @@ def lister_pending(account_id: int = 0):
     Utilisé par Graham POS pour afficher le badge rouge et les alertes.
     """
     try:
-        query = supabase.table("transactions") \
+        query = supabase_admin.table("transactions") \
                         .select("*") \
                         .eq("statut", "pending") \
                         .order("created_at", desc=True)
@@ -1057,7 +1067,7 @@ def session_est_du_jour(created_at_str) -> bool:
         return False
 
 
-def reseau_est_actif(account_id: int) -> bool:
+def reseau_est_actif(account_id: int, user_uuid: str = None) -> bool:
     """
     ── FIX ──────────────────────────────────────────────────────────────────
     Cette fonction était APPELÉE par maj_current_cash() mais n'était jamais
@@ -1067,17 +1077,27 @@ def reseau_est_actif(account_id: int) -> bool:
     même si elles étaient bien enregistrées dans la table `transactions`.
     ──────────────────────────────────────────────────────────────────────────
 
+    ── FIX multi-tenant ─────────────────────────────────────────────────────
+    account_id (1/2/3 = MTN/MOOV/CELTIS) est IDENTIQUE pour tous les
+    marchands — ce n'est pas un identifiant par utilisateur. Cette fonction
+    utilise supabase_admin (service role), qui contourne RLS : sans filtre
+    explicite sur user_uuid, elle lirait le statut ON/OFF d'un AUTRE
+    marchand utilisant le même réseau. On filtre donc aussi par user_uuid
+    quand il est fourni.
+    ──────────────────────────────────────────────────────────────────────────
+
     Vérifie si le réseau (compte) est actif, en lisant le champ `actif`
-    de la dernière session cash_sessions pour ce compte.
+    de la dernière session cash_sessions pour ce compte + cet utilisateur.
     Retourne True si aucune session n'existe encore (ouvert par défaut),
     ou si `actif` n'est pas explicitement False.
     """
     try:
-        res = supabase_admin.table("cash_sessions").select("actif") \
-                            .eq("account_id", account_id) \
-                            .gt("opening_cash", 0) \
-                            .order("created_at", desc=True) \
-                            .limit(1).execute()
+        q = supabase_admin.table("cash_sessions").select("actif") \
+                          .eq("account_id", account_id) \
+                          .gt("opening_cash", 0)
+        if user_uuid:
+            q = q.eq("user_uuid", user_uuid)
+        res = q.order("created_at", desc=True).limit(1).execute()
         if res.data:
             return res.data[0].get("actif", True) is not False
         return True  # Pas de session = réseau ouvert par défaut
@@ -1092,7 +1112,8 @@ def reseau_est_actif(account_id: int) -> bool:
 # ════════════════════════════════════════════════════════════════════════════
 
 def transaction_engine(account_id: int, amount: int, type_operation: str,
-                       transaction_id: str = "", solde_sim_apres: int = 0) -> bool:
+                       transaction_id: str = "", solde_sim_apres: int = 0,
+                       user_uuid: str = None) -> bool:
     """
     SEULE fonction qui modifie current_cash, current_virtuel et cash_movements.
 
@@ -1103,6 +1124,14 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
     RETRAIT : client prend cash ← agent débite SIM
         cash physique  DIMINUE   (-amount)
         cash virtuel   AUGMENTE  (+amount)
+
+    ── FIX multi-tenant ─────────────────────────────────────────────────────
+    Cette fonction utilise supabase_admin (service role), qui contourne RLS.
+    account_id (1/2/3) est partagé par TOUS les marchands — sans le filtre
+    user_uuid ci-dessous, elle pourrait modifier la session cash d'un AUTRE
+    marchand utilisant le même réseau. user_uuid est donc obligatoire dès
+    qu'il est disponible (récupéré depuis tracker_devices ou transactions).
+    ──────────────────────────────────────────────────────────────────────────
 
     Retourne True si succès, False sinon.
     """
@@ -1122,13 +1151,17 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
 
     # ── Lire la session active ─────────────────────────────────────
     try:
-        res = supabase_admin.table("cash_sessions").select(
+        q = supabase_admin.table("cash_sessions").select(
             "id,current_cash,opening_cash,current_virtuel,opening_virtuel,created_at"
-        ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0) \
-         .order("created_at", desc=True).limit(1).execute()
+        ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0)
+        if user_uuid:
+            q = q.eq("user_uuid", user_uuid)
+        res = q.order("created_at", desc=True).limit(1).execute()
 
         if not res.data:
-            logger.warning(f"⏭ transaction_engine: aucune session active (account_id={account_id})")
+            logger.warning(
+                f"⏭ transaction_engine: aucune session active "
+                f"(account_id={account_id}, user_uuid={user_uuid})")
             return False
     except Exception as e:
         logger.error(f"⛔ transaction_engine: erreur lecture session: {e}")
@@ -1193,6 +1226,7 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
         "nouveau_physique": cash_ap,
         "ancien_virtuel":   virt_av,
         "nouveau_virtuel":  virt_ap,
+        "user_uuid":        user_uuid,
     }
     if transaction_id:
         mv["transaction_id"] = transaction_id
@@ -1203,7 +1237,8 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
             supabase_admin.table("cash_movements").insert({
                 "account_id": account_id, "amount": delta_cash,
                 "type": type_operation,   "cash_apres": cash_ap,
-                "transaction_id": transaction_id or None
+                "transaction_id": transaction_id or None,
+                "user_uuid": user_uuid,
             }).execute()
         except Exception as e2:
             logger.error(f"Erreur écriture cash_movements: {e2}")
@@ -1214,7 +1249,7 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
 
 def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_nouveau: int = 0, solde_ancien: int = 0,
-                     transaction_id: str = "") -> bool:
+                     transaction_id: str = "", user_uuid: str = None) -> bool:
     """
     Détermine DEPOT ou RETRAIT et délègue à transaction_engine().
     C'est la SEULE façon d'appeler transaction_engine depuis l'extérieur.
@@ -1222,7 +1257,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     if amount <= 0:
         return False
 
-    if not reseau_est_actif(account_id):
+    if not reseau_est_actif(account_id, user_uuid):
         logger.info(f"⏭ Réseau {account_id} OFF → cash non mis à jour")
         return False
 
@@ -1260,7 +1295,8 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         amount         = amount,
         type_operation = type_op,
         transaction_id = transaction_id,
-        solde_sim_apres= solde_nouveau
+        solde_sim_apres= solde_nouveau,
+        user_uuid      = user_uuid,
     )
 
 def _detecter_operateur(sender: str, body: str) -> str:
