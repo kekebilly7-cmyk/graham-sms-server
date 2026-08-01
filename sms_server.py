@@ -930,6 +930,14 @@ def debug_cash(account_id: int):
     """
     Diagnostic rapide de l'état du cash pour un compte.
     Appeler depuis le navigateur pour vérifier sans envoyer de SMS.
+
+    ── FIX diagnostic multi-tenant ──────────────────────────────────────────
+    Affiche maintenant AUSSI, côte à côte : le user_uuid de la session cash
+    active, et le(s) user_uuid des appareils Android associés à ce réseau.
+    S'ils ne correspondent pas, transaction_engine() ne trouvera jamais la
+    session (le téléphone n'est pas associé au même compte que celui qui a
+    saisi le cash départ sur le desktop) — visible ici sans lire les logs.
+    ──────────────────────────────────────────────────────────────────────
     """
     try:
         res = supabase_admin.table("cash_sessions").select("*") \
@@ -951,28 +959,57 @@ def debug_cash(account_id: int):
     except Exception:
         mouvements = []
 
+    try:
+        res_devices = supabase_admin.table("tracker_devices") \
+                      .select("device_id,device_name,user_uuid,is_active") \
+                      .execute()
+        appareils = res_devices.data or []
+    except Exception:
+        appareils = []
+
+    session_user_uuid = session.get("user_uuid") if session else None
+    decalage = None
+    if session and appareils:
+        appareils_actifs = [a for a in appareils if a.get("is_active")]
+        uuids_appareils  = {a.get("user_uuid") for a in appareils_actifs}
+        if session_user_uuid not in uuids_appareils:
+            decalage = (
+                f"⚠️ DÉCALAGE : la session cash appartient à user_uuid="
+                f"{session_user_uuid}, mais aucun appareil actif n'est associé "
+                f"à ce même compte. Appareils actifs trouvés : "
+                f"{[(a.get('device_name'), a.get('user_uuid')) for a in appareils_actifs]}. "
+                f"→ Les SMS de ce(s) appareil(s) ne mettront JAMAIS à jour ce cash."
+            )
+
     return {
-        "account_id":     account_id,
-        "session_active": session is not None,
-        "session":        session,
+        "account_id":         account_id,
+        "session_active":     session is not None,
+        "session_user_uuid":  session_user_uuid,
+        "session":            session,
         "derniers_mouvements": mouvements,
+        "appareils_associes": appareils,
+        "decalage_detecte":   decalage,
         "message": "Session active ✅" if session else
                    "❌ Aucune session active — saisir cash départ dans Mobile Money System"
     }
 
 
 @app.post("/api/test/cash")
-def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT"):
+def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT",
+                  user_uuid: str = None):
     """
     Test direct de transaction_engine.
     type_op: DEPOT ou RETRAIT
-    Exemple: POST /api/test/cash?account_id=1&amount=5000&type_op=DEPOT
+    Exemple: POST /api/test/cash?account_id=1&amount=5000&type_op=DEPOT&user_uuid=xxx
+    Si user_uuid est omis, cherche une session sans filtre utilisateur
+    (utile uniquement en mono-utilisateur / diagnostic).
     """
     ok = transaction_engine(
         account_id     = account_id,
         amount         = amount,
         type_operation = type_op,
-        transaction_id = "TEST_MANUEL"
+        transaction_id = "TEST_MANUEL",
+        user_uuid      = user_uuid,
     )
     return {
         "status":       "✅ succès" if ok else "❌ échec",
@@ -1159,9 +1196,33 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
         res = q.order("created_at", desc=True).limit(1).execute()
 
         if not res.data:
+            # ── DIAGNOSTIC ──────────────────────────────────────────────
+            # Si aucune session n'est trouvée AVEC le filtre user_uuid, on
+            # vérifie s'il en existe une SANS ce filtre — ça révèle
+            # immédiatement un décalage entre le user_uuid du SMS (via
+            # tracker_devices) et celui de la session cash (créée depuis
+            # le desktop), au lieu de deviner à l'aveugle.
+            diag = ""
+            if user_uuid:
+                try:
+                    res_diag = supabase_admin.table("cash_sessions") \
+                        .select("id,user_uuid,created_at") \
+                        .eq("account_id", account_id).eq("actif", True) \
+                        .gt("opening_cash", 0) \
+                        .order("created_at", desc=True).limit(3).execute()
+                    if res_diag.data:
+                        autres = [(r.get("id"), r.get("user_uuid")) for r in res_diag.data]
+                        diag = (f" — ⚠️ DÉCALAGE PROBABLE : des sessions existent pour "
+                                f"account_id={account_id} mais avec un user_uuid différent : "
+                                f"{autres}. Vérifiez que le téléphone Android est associé au "
+                                f"même compte que celui connecté sur le logiciel desktop.")
+                    else:
+                        diag = " — aucune session du tout pour ce account_id (cash départ jamais saisi ?)"
+                except Exception:
+                    pass
             logger.warning(
                 f"⏭ transaction_engine: aucune session active "
-                f"(account_id={account_id}, user_uuid={user_uuid})")
+                f"(account_id={account_id}, user_uuid={user_uuid}){diag}")
             return False
     except Exception as e:
         logger.error(f"⛔ transaction_engine: erreur lecture session: {e}")
