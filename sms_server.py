@@ -50,6 +50,22 @@ ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 SEUIL_CONFIANCE_IA  = 0.75
 IA_TIMEOUT_SECONDES = 8
 
+# ── FIX sécurité : clé requise pour les endpoints /api/debug/* ──────────────
+# Ces endpoints utilisent supabase_admin (bypass RLS) — sans cette
+# protection, n'importe qui sur Internet pourrait consulter le cash/les
+# sessions/les appareils de N'IMPORTE QUEL marchand, RLS ou pas (RLS ne
+# protège que les requêtes passant par le client authentifié, jamais celles
+# qui passent délibérément par le client admin). Définir DEBUG_SECRET dans
+# les variables d'environnement Render pour activer ces routes ; si elle
+# n'est pas définie, les routes de debug répondent 403 à toute requête.
+DEBUG_SECRET = os.environ.get("DEBUG_SECRET", "")
+
+def verifier_debug_secret(x_debug_key: Optional[str]):
+    if not DEBUG_SECRET or x_debug_key != DEBUG_SECRET:
+        raise HTTPException(status_code=403,
+            detail="Accès refusé — endpoint de diagnostic protégé.")
+
+
 # Client normal (respecte RLS) — pour les opérations utilisateur
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -421,13 +437,15 @@ def health_check():
 
 
 @app.get("/api/debug/env")
-def debug_env():
+def debug_env(debug_key: Optional[str] = None):
     """
     Diagnostic : vérifie SANS RIEN EXPOSER DE SECRET si SUPABASE_SERVICE_KEY
     est bien chargée par Render, si elle diffère de la clé anonyme, et si
     elle a bien la forme d'une clé service_role (via son contenu JWT décodé,
     sans vérifier la signature — juste pour lire le champ "role").
+    Nécessite ?debug_key=<DEBUG_SECRET> dans l'URL.
     """
+    verifier_debug_secret(debug_key)
     import base64
 
     def decoder_role_jwt(jwt_token: str):
@@ -965,10 +983,12 @@ def confirmer_transaction(
 # ────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/debug/cash/{account_id}")
-def debug_cash(account_id: int):
+def debug_cash(account_id: int, debug_key: Optional[str] = None):
     """
     Diagnostic rapide de l'état du cash pour un compte.
     Appeler depuis le navigateur pour vérifier sans envoyer de SMS.
+    Nécessite ?debug_key=<DEBUG_SECRET> dans l'URL (voir variable
+    d'environnement DEBUG_SECRET sur Render).
 
     ── FIX diagnostic multi-tenant ──────────────────────────────────────────
     Affiche maintenant AUSSI, côte à côte : le user_uuid de la session cash
@@ -978,6 +998,7 @@ def debug_cash(account_id: int):
     saisi le cash départ sur le desktop) — visible ici sans lire les logs.
     ──────────────────────────────────────────────────────────────────────
     """
+    verifier_debug_secret(debug_key)
     try:
         res = supabase_admin.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
