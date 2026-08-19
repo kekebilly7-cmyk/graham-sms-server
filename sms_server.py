@@ -50,22 +50,6 @@ ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 SEUIL_CONFIANCE_IA  = 0.75
 IA_TIMEOUT_SECONDES = 8
 
-# ── FIX sécurité : clé requise pour les endpoints /api/debug/* ──────────────
-# Ces endpoints utilisent supabase_admin (bypass RLS) — sans cette
-# protection, n'importe qui sur Internet pourrait consulter le cash/les
-# sessions/les appareils de N'IMPORTE QUEL marchand, RLS ou pas (RLS ne
-# protège que les requêtes passant par le client authentifié, jamais celles
-# qui passent délibérément par le client admin). Définir DEBUG_SECRET dans
-# les variables d'environnement Render pour activer ces routes ; si elle
-# n'est pas définie, les routes de debug répondent 403 à toute requête.
-DEBUG_SECRET = os.environ.get("DEBUG_SECRET", "")
-
-def verifier_debug_secret(x_debug_key: Optional[str]):
-    if not DEBUG_SECRET or x_debug_key != DEBUG_SECRET:
-        raise HTTPException(status_code=403,
-            detail="Accès refusé — endpoint de diagnostic protégé.")
-
-
 # Client normal (respecte RLS) — pour les opérations utilisateur
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -88,7 +72,7 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_
 app = FastAPI(
     title="Graham SMS Server",
     description="Serveur de réception SMS Mobile Money — Graham POS / Tracker Android",
-    version="2.0.1"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -431,49 +415,8 @@ def health_check():
     return {
         "status":    "ok",
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "version":   "2.0.1",
+        "version":   "2.0.0",
         "ia_active": claude_client is not None
-    }
-
-
-@app.get("/api/debug/env")
-def debug_env(debug_key: Optional[str] = None):
-    """
-    Diagnostic : vérifie SANS RIEN EXPOSER DE SECRET si SUPABASE_SERVICE_KEY
-    est bien chargée par Render, si elle diffère de la clé anonyme, et si
-    elle a bien la forme d'une clé service_role (via son contenu JWT décodé,
-    sans vérifier la signature — juste pour lire le champ "role").
-    Nécessite ?debug_key=<DEBUG_SECRET> dans l'URL.
-    """
-    verifier_debug_secret(debug_key)
-    import base64
-
-    def decoder_role_jwt(jwt_token: str):
-        try:
-            partie_payload = jwt_token.split(".")[1]
-            partie_payload += "=" * (-len(partie_payload) % 4)  # padding
-            payload = json.loads(base64.urlsafe_b64decode(partie_payload))
-            return payload.get("role")
-        except Exception:
-            return None
-
-    service_key_definie = bool(SUPABASE_SERVICE_KEY)
-    anon_key_definie     = bool(SUPABASE_KEY)
-    cle_effectivement_utilisee = SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
-
-    return {
-        "SUPABASE_SERVICE_KEY_definie": service_key_definie,
-        "SUPABASE_SERVICE_KEY_longueur": len(SUPABASE_SERVICE_KEY) if service_key_definie else 0,
-        "SUPABASE_KEY_definie":         anon_key_definie,
-        "role_dans_la_cle_admin_utilisee": decoder_role_jwt(cle_effectivement_utilisee),
-        "les_deux_cles_sont_identiques": (SUPABASE_KEY == SUPABASE_SERVICE_KEY) if (service_key_definie and anon_key_definie) else None,
-        "message": (
-            "✅ La clé admin utilisée a bien le rôle 'service_role'"
-            if decoder_role_jwt(cle_effectivement_utilisee) == "service_role"
-            else "❌ La clé admin utilisée N'A PAS le rôle service_role — "
-                 "SUPABASE_SERVICE_KEY est absente/vide sur Render, ou "
-                 "contient en réalité la clé anon."
-        ),
     }
 
 
@@ -519,9 +462,23 @@ def activer_tracker(payload: ActivationRequest):
 
     profil    = res.data[0]
     user_uuid = profil["id"]
-    user_name = (profil.get("nom_complet")
-                 or profil.get("nom_entreprise")
-                 or "Commerçant")
+    user_name_brut = (profil.get("nom_complet")
+                      or profil.get("nom_entreprise")
+                      or "")
+
+    if not user_name_brut:
+        # Fallback : récupérer l'email depuis auth.users via l'admin API
+        try:
+            auth_user = supabase_admin.auth.admin.get_user_by_id(user_uuid)
+            email     = getattr(getattr(auth_user, "user", None), "email", None) or ""
+            # Utiliser la partie avant @ comme nom affiché
+            user_name_brut = email.split("@")[0].replace(".", " ").title() if email else ""
+            logger.info(f"🔍 Fallback email pour nom: '{user_name_brut}'")
+        except Exception as e:
+            logger.warning(f"Impossible de récupérer l'email: {e}")
+            user_name_brut = ""
+
+    user_name = f"Commerçant {user_name_brut}".strip() if user_name_brut else "Commerçant"
 
     api_token = secrets.token_hex(32)
 
@@ -684,7 +641,7 @@ def recevoir_sms(
     ).hexdigest()
 
     try:
-        existing = supabase_admin.table("transactions") \
+        existing = supabase.table("transactions") \
                            .select("id") \
                            .eq("device_id", device_id) \
                            .eq("sms_hash",  sms_hash) \
@@ -708,17 +665,8 @@ def recevoir_sms(
     solde     = int(parsed.get("solde",        0))
     frais     = int(parsed.get("frais",        0))
 
-    # ── FIX ──────────────────────────────────────────────────────────────
-    # Avant : le statut "pending" n'était déclenché QUE si source == "ia".
-    # Quand l'IA échoue/timeout, source devient "regex" — et le regex fixe
-    # lui-même une confiance basse (0.60) pour les messages qu'il ne
-    # reconnaît pas ("message bizarre"), mais cette confiance était
-    # totalement ignorée puisque source != "ia". Résultat : un SMS
-    # ambigu passé par le fallback regex était TOUJOURS "confirmed"
-    # immédiatement, et le cash se mettait à jour sans validation humaine.
-    # Maintenant on vérifie la confiance quelle que soit la source.
-    # ───────────────────────────────────────────────────────────────────
-    statut = "pending" if confiance < SEUIL_CONFIANCE_IA else "confirmed"
+    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
+             else "confirmed"
 
     operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
     account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
@@ -767,16 +715,12 @@ def recevoir_sms(
                 f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
 
     # ── Récupérer le solde précédent AVANT l'insert (pour calcul delta) ──
-    # FIX multi-tenant : filtré par user_uuid, sinon deux marchands utilisant
-    # le même réseau (account_id identique) pourraient se voir mélanger leurs
-    # soldes SIM lors du calcul du delta DEPOT/RETRAIT.
     solde_precedent = 0
     if solde > 0:
         try:
-            res_prev = supabase_admin.table("transactions") \
+            res_prev = supabase.table("transactions") \
                                .select("solde") \
                                .eq("account_id", account_id) \
-                               .eq("user_uuid", user_uuid) \
                                .not_.is_("solde", "null") \
                                .gt("solde", 0) \
                                .order("created_at", desc=True) \
@@ -815,13 +759,13 @@ def recevoir_sms(
     }
 
     try:
-        res_ins = supabase_admin.table("transactions").insert(
+        res_ins = supabase.table("transactions").insert(
             {**insert_data, **optional_fields}
         ).execute()
     except Exception as e:
         logger.warning(f"Insert complet échoué ({e}) — tentative minimale")
         try:
-            res_ins = supabase_admin.table("transactions").insert(insert_data).execute()
+            res_ins = supabase.table("transactions").insert(insert_data).execute()
         except Exception as e2:
             logger.error(f"Erreur insertion: {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
@@ -838,8 +782,7 @@ def recevoir_sms(
                 raison          = raison,
                 solde_nouveau   = solde,
                 solde_ancien    = solde_precedent,
-                transaction_id  = tx_id_str,
-                user_uuid       = user_uuid,
+                transaction_id  = tx_id_str
             )
         except Exception as e_cash:
             logger.error(f"Erreur maj cash: {e_cash}")
@@ -866,24 +809,10 @@ def confirmer_transaction(
 ):
     """
     Confirme manuellement une transaction en statut 'pending'.
-    Appelé depuis Graham POS quand le caissier choisit le bon type
-    (ou clique "Ignorer").
+    Appelé depuis Graham POS quand le caissier choisit le bon type.
 
-    ── FIX ──────────────────────────────────────────────────────────────
-    Avant, cette fonction ne faisait que changer raison/statut en base et
-    n'appelait JAMAIS transaction_engine() — une transaction confirmée
-    manuellement n'avait donc aucun impact sur le cash.
-    Maintenant :
-      - Si le caissier choisit un vrai type (dépôt/retrait/transfert/...)
-        → on appelle transaction_engine() à CE moment précis. C'est le
-        SEUL moment où le cash bouge pour une transaction qui était
-        "pending" — jamais avant la décision humaine.
-      - Si le caissier clique "Ignorer" (raison == "ignored")
-        → statut passe à "confirmed" (elle s'affiche "✅ OK") mais on ne
-        touche NI au cash NI au solde. raison="ignored" ne correspond à
-        aucun filtre momo_* utilisé ailleurs (totaux SIM, synchronisation
-        cash côté PC), donc elle reste sans aucun effet, nulle part.
-    ────────────────────────────────────────────────────────────────────
+    Cette fonction existait dans la version précédente — conservée et
+    étendue pour mettre à jour aussi sim_label si disponible.
     """
     raisons_valides = {
         "momo_depot", "momo_retrait", "momo_transfert",
@@ -895,24 +824,10 @@ def confirmer_transaction(
             detail=f"Raison invalide. Valeurs acceptées : {raisons_valides}"
         )
 
-    # Lire la transaction AVANT de la modifier — on a besoin de son
-    # montant, de son solde SIM et de son account_id pour calculer l'impact.
-    try:
-        res_tx = supabase_admin.table("transactions").select("*") \
-                         .eq("id", transaction_id).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not res_tx.data:
-        raise HTTPException(status_code=404, detail="Transaction introuvable")
-    tx = res_tx.data[0]
-
-    # Une décision humaine a été prise → statut devient "confirmed" dans
-    # tous les cas (y compris "Ignorer" : la transaction n'est plus en
-    # attente, elle apparaît juste sans impact cash).
-    nouveau_statut = "confirmed"
+    nouveau_statut = "confirmed" if payload.raison != "ignored" else "ignored"
 
     try:
-        res = supabase_admin.table("transactions").update({
+        res = supabase.table("transactions").update({
             "raison":  payload.raison,
             "statut":  nouveau_statut,
         }).eq("id", transaction_id).execute()
@@ -922,59 +837,13 @@ def confirmer_transaction(
     if not res.data:
         raise HTTPException(status_code=404, detail="Transaction introuvable")
 
-    # ── Impact cash — uniquement si ce n'est PAS "Ignorer" ─────────────
-    impact_cash = False
-    if payload.raison != "ignored":
-        amount        = int(tx.get("amount", 0) or 0)
-        account_id    = int(tx.get("account_id", 1) or 1)
-        solde_nouveau = int(tx.get("solde", 0) or 0)
-        user_uuid_tx  = tx.get("user_uuid")
-
-        # Chercher le solde SIM juste avant cette transaction (pour le
-        # calcul du delta, comme le fait recevoir_sms()).
-        # FIX multi-tenant : filtré aussi par user_uuid, sinon on pourrait
-        # lire le solde SIM d'un AUTRE marchand utilisant le même réseau.
-        solde_ancien = 0
-        try:
-            q_prev = supabase_admin.table("transactions") \
-                               .select("solde") \
-                               .eq("account_id", account_id) \
-                               .not_.is_("solde", "null") \
-                               .gt("solde", 0) \
-                               .lt("created_at", tx.get("created_at", ""))
-            if user_uuid_tx:
-                q_prev = q_prev.eq("user_uuid", user_uuid_tx)
-            res_prev = q_prev.order("created_at", desc=True).limit(1).execute()
-            if res_prev.data:
-                solde_ancien = int(res_prev.data[0].get("solde") or 0)
-        except Exception as e:
-            logger.warning(f"Impossible de lire le solde précédent (confirmation manuelle): {e}")
-
-        if amount > 0:
-            try:
-                impact_cash = maj_current_cash(
-                    account_id      = account_id,
-                    amount          = amount,
-                    raison          = payload.raison,
-                    solde_nouveau   = solde_nouveau,
-                    solde_ancien    = solde_ancien,
-                    transaction_id  = str(transaction_id),
-                    user_uuid       = user_uuid_tx,
-                )
-            except Exception as e:
-                logger.error(f"Erreur maj cash (confirmation manuelle #{transaction_id}): {e}")
-
-    logger.info(
-        f"✅ Transaction #{transaction_id} confirmée manuellement: "
-        f"{payload.raison} (impact_cash={impact_cash})"
-    )
+    logger.info(f"✅ Transaction #{transaction_id} confirmée: {payload.raison}")
     return {
-        "status":      "ok",
-        "id":          transaction_id,
-        "raison":      payload.raison,
-        "statut":      nouveau_statut,
-        "impact_cash": impact_cash,
-        "message":     "Transaction confirmée"
+        "status":  "ok",
+        "id":      transaction_id,
+        "raison":  payload.raison,
+        "statut":  nouveau_statut,
+        "message": "Transaction confirmée"
     }
 
 
@@ -983,22 +852,11 @@ def confirmer_transaction(
 # ────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/debug/cash/{account_id}")
-def debug_cash(account_id: int, debug_key: Optional[str] = None):
+def debug_cash(account_id: int):
     """
     Diagnostic rapide de l'état du cash pour un compte.
     Appeler depuis le navigateur pour vérifier sans envoyer de SMS.
-    Nécessite ?debug_key=<DEBUG_SECRET> dans l'URL (voir variable
-    d'environnement DEBUG_SECRET sur Render).
-
-    ── FIX diagnostic multi-tenant ──────────────────────────────────────────
-    Affiche maintenant AUSSI, côte à côte : le user_uuid de la session cash
-    active, et le(s) user_uuid des appareils Android associés à ce réseau.
-    S'ils ne correspondent pas, transaction_engine() ne trouvera jamais la
-    session (le téléphone n'est pas associé au même compte que celui qui a
-    saisi le cash départ sur le desktop) — visible ici sans lire les logs.
-    ──────────────────────────────────────────────────────────────────────
     """
-    verifier_debug_secret(debug_key)
     try:
         res = supabase_admin.table("cash_sessions").select("*") \
                       .eq("account_id", account_id) \
@@ -1011,7 +869,7 @@ def debug_cash(account_id: int, debug_key: Optional[str] = None):
         session = None
 
     try:
-        mvs = supabase_admin.table("cash_movements").select("*") \
+        mvs = supabase.table("cash_movements").select("*") \
                       .eq("account_id", account_id) \
                       .order("created_at", desc=True) \
                       .limit(5).execute()
@@ -1019,67 +877,38 @@ def debug_cash(account_id: int, debug_key: Optional[str] = None):
     except Exception:
         mouvements = []
 
-    try:
-        res_devices = supabase_admin.table("tracker_devices") \
-                      .select("device_id,device_name,user_uuid,is_active") \
-                      .execute()
-        appareils = res_devices.data or []
-    except Exception:
-        appareils = []
-
-    session_user_uuid = session.get("user_uuid") if session else None
-    decalage = None
-    if session and appareils:
-        appareils_actifs = [a for a in appareils if a.get("is_active")]
-        uuids_appareils  = {a.get("user_uuid") for a in appareils_actifs}
-        if session_user_uuid not in uuids_appareils:
-            decalage = (
-                f"⚠️ DÉCALAGE : la session cash appartient à user_uuid="
-                f"{session_user_uuid}, mais aucun appareil actif n'est associé "
-                f"à ce même compte. Appareils actifs trouvés : "
-                f"{[(a.get('device_name'), a.get('user_uuid')) for a in appareils_actifs]}. "
-                f"→ Les SMS de ce(s) appareil(s) ne mettront JAMAIS à jour ce cash."
-            )
-
     return {
-        "account_id":         account_id,
-        "session_active":     session is not None,
-        "session_user_uuid":  session_user_uuid,
-        "session":            session,
+        "account_id":     account_id,
+        "session_active": session is not None,
+        "session":        session,
         "derniers_mouvements": mouvements,
-        "appareils_associes": appareils,
-        "decalage_detecte":   decalage,
         "message": "Session active ✅" if session else
                    "❌ Aucune session active — saisir cash départ dans Mobile Money System"
     }
 
 
-@app.post("/api/test/cash")
-def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT",
-                  user_uuid: str = None):
+@app.get("/api/test/cash")
+def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT"):
     """
-    Test direct de transaction_engine.
-    type_op: DEPOT ou RETRAIT
-    Exemple: POST /api/test/cash?account_id=1&amount=5000&type_op=DEPOT&user_uuid=xxx
-    Si user_uuid est omis, cherche une session sans filtre utilisateur
-    (utile uniquement en mono-utilisateur / diagnostic).
+    Test direct de transaction_engine — accessible depuis le navigateur.
+    Exemple: https://graham-sms-server.onrender.com/api/test/cash?account_id=1&amount=5000&type_op=DEPOT
     """
     ok = transaction_engine(
         account_id     = account_id,
         amount         = amount,
         type_operation = type_op,
-        transaction_id = "TEST_MANUEL",
-        user_uuid      = user_uuid,
+        transaction_id = "TEST_MANUEL"
     )
     return {
-        "status":       "✅ succès" if ok else "❌ échec",
-        "type_op":      type_op,
-        "amount":       amount,
-        "account_id":   account_id,
-        "instruction":  "Voir les logs Render pour le détail",
+        "status":     "✅ succès" if ok else "❌ échec",
+        "type_op":    type_op,
+        "amount":     amount,
+        "account_id": account_id,
+        "message":    "Vérifier les logs Render et la table cash_sessions dans Supabase",
     }
 
 
+@app.get("/api/debug/code/{code}")
 def debug_code(code: str):
     """
     Endpoint de diagnostic — vérifie si un code existe dans mm_profiles.
@@ -1118,13 +947,14 @@ def debug_code(code: str):
 
 
 
+@app.get("/api/pending")
 def lister_pending(account_id: int = 0):
     """
     Retourne les transactions en attente de confirmation manuelle.
     Utilisé par Graham POS pour afficher le badge rouge et les alertes.
     """
     try:
-        query = supabase_admin.table("transactions") \
+        query = supabase.table("transactions") \
                         .select("*") \
                         .eq("statut", "pending") \
                         .order("created_at", desc=True)
@@ -1140,77 +970,13 @@ def lister_pending(account_id: int = 0):
 # UTILITAIRES INTERNES
 # ════════════════════════════════════════════════════════════════════════════
 
-def session_est_du_jour(created_at_str) -> bool:
-    """
-    ── FIX reset 24h ────────────────────────────────────────────────────────
-    Vérifie si une session cash_sessions a été créée aujourd'hui (fuseau
-    Paris, offset fixe +2h — même convention que le reste du fichier).
-    Une session d'un jour précédent est considérée périmée : le cash départ
-    doit être ressaisi chaque nouvelle journée avant que les SMS ne
-    recommencent à impacter le cash physique/virtuel.
-    """
-    if not created_at_str:
-        return False
-    try:
-        s = str(created_at_str).replace("Z", "+00:00")
-        dt_utc = datetime.datetime.fromisoformat(s)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
-        paris_tz = datetime.timezone(datetime.timedelta(hours=2))
-        dt_paris = dt_utc.astimezone(paris_tz)
-        aujourd_hui_paris = datetime.datetime.now(paris_tz).date()
-        return dt_paris.date() == aujourd_hui_paris
-    except Exception:
-        return False
-
-
-def reseau_est_actif(account_id: int, user_uuid: str = None) -> bool:
-    """
-    ── FIX ──────────────────────────────────────────────────────────────────
-    Cette fonction était APPELÉE par maj_current_cash() mais n'était jamais
-    DÉFINIE nulle part dans le fichier. Chaque appel provoquait un NameError,
-    silencieusement avalé par le try/except dans recevoir_sms() — résultat :
-    le cash physique n'était JAMAIS mis à jour par les transactions SMS,
-    même si elles étaient bien enregistrées dans la table `transactions`.
-    ──────────────────────────────────────────────────────────────────────────
-
-    ── FIX multi-tenant ─────────────────────────────────────────────────────
-    account_id (1/2/3 = MTN/MOOV/CELTIS) est IDENTIQUE pour tous les
-    marchands — ce n'est pas un identifiant par utilisateur. Cette fonction
-    utilise supabase_admin (service role), qui contourne RLS : sans filtre
-    explicite sur user_uuid, elle lirait le statut ON/OFF d'un AUTRE
-    marchand utilisant le même réseau. On filtre donc aussi par user_uuid
-    quand il est fourni.
-    ──────────────────────────────────────────────────────────────────────────
-
-    Vérifie si le réseau (compte) est actif, en lisant le champ `actif`
-    de la dernière session cash_sessions pour ce compte + cet utilisateur.
-    Retourne True si aucune session n'existe encore (ouvert par défaut),
-    ou si `actif` n'est pas explicitement False.
-    """
-    try:
-        q = supabase_admin.table("cash_sessions").select("actif") \
-                          .eq("account_id", account_id) \
-                          .gt("opening_cash", 0)
-        if user_uuid:
-            q = q.eq("user_uuid", user_uuid)
-        res = q.order("created_at", desc=True).limit(1).execute()
-        if res.data:
-            return res.data[0].get("actif", True) is not False
-        return True  # Pas de session = réseau ouvert par défaut
-    except Exception as e:
-        logger.error(f"⛔ Erreur reseau_est_actif(account_id={account_id}): {e}")
-        # En cas d'erreur de lecture, on ne bloque pas la mise à jour du cash
-        return True
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # TRANSACTION ENGINE — SEULE FONCTION AUTORISÉE À MODIFIER LE CASH
 # ════════════════════════════════════════════════════════════════════════════
 
 def transaction_engine(account_id: int, amount: int, type_operation: str,
-                       transaction_id: str = "", solde_sim_apres: int = 0,
-                       user_uuid: str = None) -> bool:
+                       transaction_id: str = "", solde_sim_apres: int = 0) -> bool:
     """
     SEULE fonction qui modifie current_cash, current_virtuel et cash_movements.
 
@@ -1221,14 +987,6 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
     RETRAIT : client prend cash ← agent débite SIM
         cash physique  DIMINUE   (-amount)
         cash virtuel   AUGMENTE  (+amount)
-
-    ── FIX multi-tenant ─────────────────────────────────────────────────────
-    Cette fonction utilise supabase_admin (service role), qui contourne RLS.
-    account_id (1/2/3) est partagé par TOUS les marchands — sans le filtre
-    user_uuid ci-dessous, elle pourrait modifier la session cash d'un AUTRE
-    marchand utilisant le même réseau. user_uuid est donc obligatoire dès
-    qu'il est disponible (récupéré depuis tracker_devices ou transactions).
-    ──────────────────────────────────────────────────────────────────────────
 
     Retourne True si succès, False sinon.
     """
@@ -1248,62 +1006,19 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
 
     # ── Lire la session active ─────────────────────────────────────
     try:
-        q = supabase_admin.table("cash_sessions").select(
-            "id,current_cash,opening_cash,current_virtuel,opening_virtuel,created_at"
-        ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0)
-        if user_uuid:
-            q = q.eq("user_uuid", user_uuid)
-        res = q.order("created_at", desc=True).limit(1).execute()
+        res = supabase_admin.table("cash_sessions").select(
+            "id,current_cash,opening_cash,current_virtuel,opening_virtuel"
+        ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0) \
+         .order("created_at", desc=True).limit(1).execute()
 
         if not res.data:
-            # ── DIAGNOSTIC ──────────────────────────────────────────────
-            # Si aucune session n'est trouvée AVEC le filtre user_uuid, on
-            # vérifie s'il en existe une SANS ce filtre — ça révèle
-            # immédiatement un décalage entre le user_uuid du SMS (via
-            # tracker_devices) et celui de la session cash (créée depuis
-            # le desktop), au lieu de deviner à l'aveugle.
-            diag = ""
-            if user_uuid:
-                try:
-                    res_diag = supabase_admin.table("cash_sessions") \
-                        .select("id,user_uuid,created_at") \
-                        .eq("account_id", account_id).eq("actif", True) \
-                        .gt("opening_cash", 0) \
-                        .order("created_at", desc=True).limit(3).execute()
-                    if res_diag.data:
-                        autres = [(r.get("id"), r.get("user_uuid")) for r in res_diag.data]
-                        diag = (f" — ⚠️ DÉCALAGE PROBABLE : des sessions existent pour "
-                                f"account_id={account_id} mais avec un user_uuid différent : "
-                                f"{autres}. Vérifiez que le téléphone Android est associé au "
-                                f"même compte que celui connecté sur le logiciel desktop.")
-                    else:
-                        diag = " — aucune session du tout pour ce account_id (cash départ jamais saisi ?)"
-                except Exception:
-                    pass
-            logger.warning(
-                f"⏭ transaction_engine: aucune session active "
-                f"(account_id={account_id}, user_uuid={user_uuid}){diag}")
+            logger.warning(f"⏭ transaction_engine: aucune session active (account_id={account_id})")
             return False
     except Exception as e:
         logger.error(f"⛔ transaction_engine: erreur lecture session: {e}")
         return False
 
     sess      = res.data[0]
-
-    # ── FIX reset 24h ────────────────────────────────────────────────
-    # Une session créée un jour précédent (fuseau Paris) est considérée
-    # périmée : le cash départ doit être ressaisi chaque jour côté PC avant
-    # que les SMS ne recommencent à impacter le cash. La transaction reste
-    # bien enregistrée dans `transactions` (recevoir_sms s'en charge avant
-    # d'appeler cette fonction) — seul l'impact sur le cash est bloqué ici.
-    if not session_est_du_jour(sess.get("created_at")):
-        logger.info(
-            f"⏭ transaction_engine: session du {sess.get('created_at')} "
-            f"périmée (pas d'aujourd'hui) → cash non mis à jour, "
-            f"en attente de ressaisie du cash départ (account_id={account_id})"
-        )
-        return False
-
     sess_id   = sess["id"]
 
     # Valeurs actuelles
@@ -1347,7 +1062,6 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
         "nouveau_physique": cash_ap,
         "ancien_virtuel":   virt_av,
         "nouveau_virtuel":  virt_ap,
-        "user_uuid":        user_uuid,
     }
     if transaction_id:
         mv["transaction_id"] = transaction_id
@@ -1358,8 +1072,7 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
             supabase_admin.table("cash_movements").insert({
                 "account_id": account_id, "amount": delta_cash,
                 "type": type_operation,   "cash_apres": cash_ap,
-                "transaction_id": transaction_id or None,
-                "user_uuid": user_uuid,
+                "transaction_id": transaction_id or None
             }).execute()
         except Exception as e2:
             logger.error(f"Erreur écriture cash_movements: {e2}")
@@ -1370,7 +1083,7 @@ def transaction_engine(account_id: int, amount: int, type_operation: str,
 
 def maj_current_cash(account_id: int, amount: int, raison: str,
                      solde_nouveau: int = 0, solde_ancien: int = 0,
-                     transaction_id: str = "", user_uuid: str = None) -> bool:
+                     transaction_id: str = "") -> bool:
     """
     Détermine DEPOT ou RETRAIT et délègue à transaction_engine().
     C'est la SEULE façon d'appeler transaction_engine depuis l'extérieur.
@@ -1378,7 +1091,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
     if amount <= 0:
         return False
 
-    if not reseau_est_actif(account_id, user_uuid):
+    if not reseau_est_actif(account_id):
         logger.info(f"⏭ Réseau {account_id} OFF → cash non mis à jour")
         return False
 
@@ -1416,8 +1129,7 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         amount         = amount,
         type_operation = type_op,
         transaction_id = transaction_id,
-        solde_sim_apres= solde_nouveau,
-        user_uuid      = user_uuid,
+        solde_sim_apres= solde_nouveau
     )
 
 def _detecter_operateur(sender: str, body: str) -> str:
