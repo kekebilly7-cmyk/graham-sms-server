@@ -1,1153 +1,305 @@
-"""
-════════════════════════════════════════════════════════════════════════════
-SMS SERVER — Graham POS / Mobile Money Tracker
-Déployé sur : https://graham-sms-server.onrender.com
-════════════════════════════════════════════════════════════════════════════
-
-Fonctionnalités :
-  - Réception des SMS Mobile Money depuis l'app Android Tracker
-  - Parsing IA (Claude Haiku) avec fallback regex automatique
-  - Transactions < 75% de confiance → statut "pending" (confirmation manuelle)
-  - Activation / dissociation des appareils Android
-  - Endpoints Graham POS (confirmation manuelle des transactions pending)
-  - Health check
-
-Tables Supabase utilisées :
-  - transactions      (données Mobile Money)
-  - cash_sessions     (sessions de caisse par réseau)
-  - cash_movements    (mouvements de caisse)
-  - tracker_devices   (appareils Android associés)
-  - mm_profiles       (profils commerçants + merchant_code)
-"""
-
-import os
-import re
-import json
-import secrets
-import logging
-import datetime
-from typing import Optional
-
-import anthropic
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from supabase import create_client
+import re
 
-# ════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ════════════════════════════════════════════════════════════════════════════
+app = FastAPI()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-SUPABASE_URL         = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY         = os.environ.get("SUPABASE_KEY", "")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-ANTHROPIC_API_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
-
-SEUIL_CONFIANCE_IA  = 0.75
-IA_TIMEOUT_SECONDES = 8
-
-# Client normal (respecte RLS) — pour les opérations utilisateur
+SUPABASE_URL = "https://cjwbryhwfofpoopcbmpn.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqd2JyeWh3Zm9mcG9vcGNibXBuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNjYwNjMsImV4cCI6MjA5MTk0MjA2M30.rCjCQdFfHzbKf12XAIrwbOTkVCPcdEqOXD7WiBno4Uk"
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Client admin (bypass RLS) — UNIQUEMENT pour :
-#   1. Vérifier merchant_code lors de l'activation
-#   2. Créer/mettre à jour tracker_devices
-# Ne jamais utiliser pour lire des données personnelles des commerçants
-supabase_admin = create_client(
-    SUPABASE_URL,
-    SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
-)
+ACCOUNT_IDS = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "ORANGE": 4}
 
-# Client Claude Haiku (IA principale)
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+class SMS(BaseModel):
+    message: str = ""
+    sender:  str = ""
 
-# ════════════════════════════════════════════════════════════════════════════
-# APP FASTAPI
-# ════════════════════════════════════════════════════════════════════════════
+def est_financier(msg: str) -> bool:
+    a_montant = bool(re.search(r'\d+\s*(?:FCFA|XOF|F\b)', msg, re.IGNORECASE))
+    mots = ["transfert","transfer","depot","dépôt","reçu","recu",
+            "envoyé","envoye","retrait","withdraw","paiement","solde",
+            "momo","credited","debited"]
+    a_mot = any(m in msg.lower() for m in mots)
+    return a_montant and a_mot
 
-app = FastAPI(
-    title="Graham SMS Server",
-    description="Serveur de réception SMS Mobile Money — Graham POS / Tracker Android",
-    version="2.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ════════════════════════════════════════════════════════════════════════════
-# MODÈLES PYDANTIC
-# ════════════════════════════════════════════════════════════════════════════
-
-class SmsPayload(BaseModel):
-    """SMS reçu depuis l'app Android Tracker."""
-    device_id:      str
-    sender:         str
-    body:           str
-    timestamp:      int
-    sim_slot:       int  = -1
-    subscription_id:int  = -1
-    sim_label:      str  = ""
-    operator:       str  = ""
-    amount:         float = 0.0
-    phone:          str  = ""
-    transaction_id: str  = ""
-    direction:      str  = "IN"
-    received_at:    int  = 0
-
-class ActivationRequest(BaseModel):
-    """Demande d'activation depuis l'app Android."""
-    merchant_code: str
-    device_id:     str
-    device_name:   str = "Mon téléphone"
-    sim_a_label:   str = ""
-    sim_b_label:   str = ""
-
-class ConfirmationRequest(BaseModel):
-    """Confirmation manuelle d'une transaction pending (depuis Graham POS)."""
-    raison: str  # momo_depot, momo_retrait, momo_transfert, momo_paiement, momo_envoi
-
-# ════════════════════════════════════════════════════════════════════════════
-# AUTHENTIFICATION — vérification du token Tracker
-# ════════════════════════════════════════════════════════════════════════════
-
-def verifier_token_tracker(authorization: str) -> dict:
-    """
-    Vérifie le Bearer token d'un appareil Android dans tracker_devices.
-    Retourne les infos de l'appareil (device_id, user_uuid) si valide.
-    Lève HTTPException 401 sinon.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token manquant")
-
-    token = authorization.replace("Bearer ", "").strip()
-
-    try:
-        res = supabase_admin.table("tracker_devices") \
-                      .select("device_id, user_uuid, is_active, device_name") \
-                      .eq("api_token", token) \
-                      .execute()
-    except Exception as e:
-        logger.error(f"Erreur vérification token: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not res.data:
-        raise HTTPException(status_code=401, detail="Token invalide ou appareil inconnu")
-
-    device = res.data[0]
-    if not device.get("is_active", False):
-        raise HTTPException(status_code=403, detail="Appareil désactivé")
-
-    # Mettre à jour last_seen_at en arrière-plan (best-effort)
-    try:
-        supabase_admin.table("tracker_devices") \
-                .update({"last_seen_at": datetime.datetime.utcnow().isoformat()}) \
-                .eq("api_token", token) \
-                .execute()
-    except Exception:
-        pass
-
-    return device
-
-# ════════════════════════════════════════════════════════════════════════════
-# PARSING IA — Claude Haiku avec fallback regex
-# ════════════════════════════════════════════════════════════════════════════
-
-def parser_sms_avec_ia(body: str, sender: str) -> dict:
-    """
-    Parse un SMS Mobile Money avec Claude Haiku.
-
-    Retourne un dict avec :
-        raison, amount, phone, nom_destinataire,
-        reference_id, solde, frais, confiance
-    Retourne None si l'IA échoue ou timeout.
-
-    La logique : IA d'abord (8s timeout, 75% seuil de confiance).
-    Si l'IA échoue → fallback automatique sur le regex classique.
-    Si l'IA réussit mais confiance < 75% → transaction stockée en "pending"
-    pour confirmation manuelle dans Graham POS.
-    """
-    if not claude_client:
-        logger.warning("Claude API non configuré — fallback regex")
-        return None
-
-    prompt = f"""Analyse ce SMS Mobile Money et extrais les informations.
-
-SMS reçu de : {sender}
-Contenu : {body}
-
-Réponds UNIQUEMENT en JSON valide avec ces champs exactement :
-{{
-  "raison": "momo_depot|momo_retrait|momo_transfert|momo_paiement|momo_envoi",
-  "amount": <montant en nombre entier, 0 si non trouvé>,
-  "phone": "<numéro de téléphone de la contrepartie, vide si absent>",
-  "nom_destinataire": "<nom affiché, vide si absent>",
-  "reference_id": "<référence/ID de transaction, vide si absent>",
-  "solde": <solde après transaction en nombre entier, 0 si non trouvé>,
-  "frais": <frais de transaction en nombre entier, 0 si non trouvé>,
-  "confiance": <score de confiance entre 0.0 et 1.0>
-}}
-
-Règles :
-- momo_depot = argent reçu sur la SIM (dépôt entrant)
-- momo_retrait = argent retiré en espèces
-- momo_transfert = envoi d'argent vers un autre numéro
-- momo_paiement = paiement d'un service ou marchand
-- momo_envoi = envoi depuis ton numéro vers autre numéro
-- confiance = ta certitude sur la classification (1.0 = certitude totale)
-- Si le SMS est ambigu ou incomplet, baisse la confiance en dessous de 0.75
-
-Ne réponds qu'avec le JSON, aucun texte autour."""
-
-    try:
-        import signal
-
-        def timeout_handler(signum, frame):
-            raise TimeoutError("IA timeout")
-
-        # signal.alarm non utilisé (incompatible avec les threads FastAPI)
-
-        response = claude_client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        # (timeout annulé automatiquement)
-
-        texte = response.content[0].text.strip()
-        # Nettoyer les backticks éventuels
-        if texte.startswith("```"):
-            texte = texte.split("```")[1]
-            if texte.startswith("json"):
-                texte = texte[4:]
-        texte = texte.strip()
-
-        resultat = json.loads(texte)
-        logger.info(f"✅ IA parsed: raison={resultat.get('raison')} confiance={resultat.get('confiance')}")
-        return resultat
-
-    except TimeoutError:
-        logger.warning(f"⏱ IA timeout après {IA_TIMEOUT_SECONDES}s — fallback regex")
-        return None
-    except json.JSONDecodeError as e:
-        logger.warning(f"⚠ IA JSON invalide: {e} — fallback regex")
-        return None
-    except Exception as e:
-        logger.error(f"❌ IA erreur: {e} — fallback regex")
-        return None
-
-
-def parser_sms_regex(body: str, sender: str) -> dict:
-    """
-    Fallback regex amélioré pour SMS Mobile Money béninois.
-    Supporte : 1312F, 5000F, 5 000 XOF, 5,000 FCFA, 5.000F
-    """
-    texte = body.lower()
+def parser_sms(message: str, sender: str) -> dict:
+    msg = message.strip()
     result = {
-        "raison":           "momo_depot",
-        "amount":           0,
-        "phone":            "",
-        "nom_destinataire": "",
-        "reference_id":     "",
-        "solde":            0,
-        "frais":            0,
-        "confiance":        0.85
+        "raw_message": msg, "sender": None, "account_id": None,
+        "phone_number": None, "amount": None, "reference_id": None,
+        "nom_destinataire": None, "solde": None, "frais": 0,
+        "date_transaction": None, "raison": "inconnu",
     }
+    if msg in ("{message}", "{{message}}", "$message", "[message]", ""):
+        result["raison"] = "test_non_resolu"
+        return result
 
-    # ── Type de transaction ────────────────────────────────────────
-    if any(k in texte for k in ["reçu", "recu", "vous avez reçu", "received",
-                                  "credite", "crédité", "depot recu", "cash in"]):
-        result["raison"] = "momo_depot"
-    elif any(k in texte for k in ["retrait", "withdrawn", "cash out"]):
-        result["raison"] = "momo_retrait"
-    elif any(k in texte for k in ["transfert", "transfer", "vous avez envoyé",
-                                   "envoyé", "envoye", "sent to"]):
-        result["raison"] = "momo_transfert"
-    elif any(k in texte for k in ["paiement", "payment", "payé", "paye"]):
-        result["raison"] = "momo_paiement"
+    msg_upper = msg.upper()
+    msg_lower = msg.lower()
+
+    if "MTN" in msg_upper or "MOMO" in msg_upper:
+        result["sender"] = "MTN"
+    elif "MOOV" in msg_upper:
+        result["sender"] = "MOOV"
+    elif "CELTIS" in msg_upper:
+        result["sender"] = "CELTIS"
+    elif "ORANGE" in msg_upper:
+        result["sender"] = "ORANGE"
+    elif any(k in msg_upper for k in ("FCFA","XOF","TRANSFERT","DEPOT","SOLDE")):
+        result["sender"] = "MTN"
+    elif (sender and sender not in ("{sender}","[from]","[sender]","")
+          and not sender.startswith("+")
+          and not sender.lstrip("+").isdigit()):
+        result["sender"] = sender
     else:
-        result["confiance"] = 0.60
+        result["sender"] = "MTN"
 
-    # ── Montant — supporte 1312F, 5 000 XOF, 5,000 FCFA, 5.000F ──
-    # Ordre : chercher d'abord le montant principal (dépôt/transfert)
-    # puis n'importe quel montant
-    patterns_montant = [
-        # "transfert 1312F" ou "dépôt 5000 XOF"
-        r'(?:transfert|depot|dépôt|reçu|recu|paiement|retrait|envoy[eé])\s+(?:de\s+)?(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|cfa|f\b)',
-        # "1312F de" ou "5 000F"
-        r'\b(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|cfa|f)\b',
-        # Montant après "montant :"
-        r'montant\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)',
-    ]
-    for pat in patterns_montant:
-        m = re.search(pat, body, re.IGNORECASE)
-        if m:
-            raw = re.sub(r'[\s,.]', '', m.group(1))
-            try:
-                val = int(raw)
-                if val > 0:
-                    result["amount"] = val
-                    break
-            except ValueError:
-                pass
+    result["account_id"] = ACCOUNT_IDS.get(result["sender"])
 
-    # ── Solde ─────────────────────────────────────────────────────
-    m_solde = re.search(
-        r'(?:solde|balance|nouveau solde)\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|f\b)?',
-        body, re.IGNORECASE
-    )
-    if m_solde:
-        raw = re.sub(r'[\s,.]', '', m_solde.group(1))
-        try:
-            result["solde"] = int(raw)
-        except ValueError:
-            pass
+    m = re.search(
+        r'(?:transfert|reçu|recu|dépôt|depot|paiement|envoyé|retrait)\s+'
+        r'(\d[\d\s\.\,]*)\s*(?:FCFA|XOF|F\b)', msg, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(\d[\d\s\.\,]*)\s*(?:FCFA|XOF|F\b)', msg, re.IGNORECASE)
+    if m:
+        s = re.sub(r'[\s\.,]', '', m.group(1))
+        try: result["amount"] = int(s)
+        except: pass
 
-    # ── Numéro de téléphone ───────────────────────────────────────
-    # Format retrait : ",2290198765," (entre virgules)
-    m_tel = re.search(r',\s*(\+?[0-9]{8,13})\s*,', body)
-    if m_tel:
-        result["phone"] = m_tel.group(1).strip()
+    ph = re.search(r'\(?(229\d{7,11})\)?', msg)
+    if not ph: ph = re.search(r'\b(229\d{7,11})\b', msg)
+    if ph: result["phone_number"] = ph.group(1)
+
+    soc = re.search(r'[Ss]oci[eé]t[eé]\s*:\s*([^\.\,\;\n]+)', msg)
+    if soc:
+        result["nom_destinataire"] = soc.group(1).strip()
     else:
-        m_tel2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body)
-        if m_tel2:
-            result["phone"] = m_tel2.group(1)
+        nom = re.search(
+            r'\ba\s+([A-ZÀ-ÿa-zà-ÿ][A-ZÀ-ÿa-zà-ÿ\s\-]{2,60}?)'
+            r'\s*(?:\(229|\d{4}-|\d{2}/)', msg, re.IGNORECASE)
+        if nom:
+            result["nom_destinataire"] = nom.group(1).strip()
         else:
-            m_tel3 = re.search(r'\b([679]\d{7})\b', body)
-            if m_tel3:
-                result["phone"] = m_tel3.group(1)
+            de = re.search(
+                r'\bde\s+([A-ZÀ-ÿ][A-ZÀ-ÿa-zà-ÿ\s\-\.]{2,40}?)'
+                r'\s*(?:\(|\.|,|Réf|Ref|numéro|$)', msg, re.IGNORECASE)
+            if de:
+                n = de.group(1).strip()
+                excl = {"mtn","momo","moov","fcfa","vous","avez","votre","compte","solde"}
+                bad  = ["effectué sur votre compte","votre compte"]
+                if n.lower() not in excl and len(n) > 2 and not any(b in n.lower() for b in bad):
+                    result["nom_destinataire"] = n
 
-    # ── Nom destinataire ──────────────────────────────────────────
-    # Format retrait : "recu de NOM ,"
-    m_nom_ret = re.search(
-        r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
-        body, re.IGNORECASE)
-    if m_nom_ret:
-        result["nom_destinataire"] = m_nom_ret.group(1).strip()
+    sol = re.search(r'[Ss]olde\s*:?\s*(\d[\d\s\.\,]*)\s*(?:FCFA|XOF|F\b)', msg, re.IGNORECASE)
+    if sol:
+        s = re.sub(r'[\s\.,]', '', sol.group(1))
+        try: result["solde"] = int(s)
+        except: pass
 
-    if not result["nom_destinataire"]:
-        # Format dépôt : "a NOM le"
-        m_nom_dep = re.search(
-            r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s+le\s+\d',
-            body, re.IGNORECASE)
-        if m_nom_dep:
-            result["nom_destinataire"] = m_nom_dep.group(1).strip()
+    fr = re.search(r'[Ff]rais\s*:?\s*(\d+)', msg)
+    if fr:
+        try: result["frais"] = int(fr.group(1))
+        except: pass
 
-    if not result["nom_destinataire"]:
-        # Format MFS marchand
-        m_mfs = re.search(
-            r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
-            body, re.IGNORECASE)
-        if m_mfs:
-            result["nom_destinataire"] = m_mfs.group(1).strip()
-
-    # ── Référence transaction — chercher un vrai ID numérique ─────
-    # Priorité aux IDs numériques longs (vrais IDs opérateurs)
-    m_id = re.search(
-        r'(?:id\s*:?\s*|ref\s*:?\s*|id:\s*)(\d{6,20})',
-        body, re.IGNORECASE
-    )
-    if m_id:
-        result["reference_id"] = m_id.group(1)
+    id_m = re.search(r'\bID\s*[:\s]*(\d{5,25})', msg, re.IGNORECASE)
+    if id_m:
+        result["reference_id"] = id_m.group(1)
     else:
-        # Fallback : chercher un code alphanumérique qui n'est pas un nom de société
-        m_ref = re.search(
-            r'(?:ref[eé]rence?\s*:?\s*|txid\s*:?\s*)([A-Z0-9]{6,20})\b',
-            body, re.IGNORECASE
-        )
-        if m_ref:
-            result["reference_id"] = m_ref.group(1)
+        ref = re.search(r'(?:Réf(?:érence)?|Ref)\s*[:\s]+([A-Z0-9]{3,25})', msg, re.IGNORECASE)
+        if ref: result["reference_id"] = ref.group(1)
 
-    # ── Frais ─────────────────────────────────────────────────────
-    m_frais = re.search(
-        r'(?:frais|fees)\s*:?\s*(\d[\d\s]*(?:[.,]\d+)?)\s*(?:xof|fcfa|f\b)?',
-        body, re.IGNORECASE
-    )
-    if m_frais:
-        raw = re.sub(r'[\s,.]', '', m_frais.group(1))
-        try:
-            result["frais"] = int(raw)
-        except ValueError:
-            pass
+    dt = re.search(r'(\d{4}-\d{2}-\d{2}[\s,]+\d{2}:\d{2}:\d{2})', msg)
+    if not dt: dt = re.search(r'(\d{4}-\d{2}-\d{2})', msg)
+    if not dt: dt = re.search(r'(\d{2}/\d{2}/\d{4}[\s]+\d{2}:\d{2})', msg)
+    if dt: result["date_transaction"] = dt.group(1).strip()
 
-    logger.info(f"📋 Regex: raison={result['raison']} amount={result['amount']} solde={result['solde']}")
+    if any(k in msg_lower for k in ["transfert","transfer"]):
+        result["raison"] = "momo_transfert"
+    elif any(k in msg_lower for k in ["vous avez reçu","avez reçu","avez recu",
+                                       "dépôt","depot","crédité","depot recu"]):
+        result["raison"] = "momo_depot"
+    elif any(k in msg_lower for k in ["vous avez envoyé","avez envoyé"]):
+        result["raison"] = "momo_envoi"
+    elif any(k in msg_lower for k in ["paiement effectué","paiement de","débité"]):
+        result["raison"] = "momo_paiement"
+    elif any(k in msg_lower for k in ["retrait","withdraw","cash out"]):
+        result["raison"] = "momo_retrait"
+    elif result["amount"]:
+        result["raison"] = "momo_transaction"
+
     return result
 
-
-def parser_sms(body: str, sender: str) -> tuple[dict, str]:
-    """
-    Orchestration IA + fallback regex.
-
-    Retourne (résultat_parsing, source) où source = "ia" ou "regex".
-
-    Logique :
-    1. Tenter l'IA (Claude Haiku) avec timeout 8s
-    2. Si l'IA réussit ET confiance >= 75% → utiliser le résultat IA
-    3. Si l'IA réussit MAIS confiance < 75% → utiliser résultat IA mais
-       la transaction sera stockée en "pending" pour confirmation manuelle
-    4. Si l'IA échoue (timeout, erreur, JSON invalide) → fallback regex
-    """
-    resultat_ia = parser_sms_avec_ia(body, sender)
-
-    if resultat_ia is not None:
-        return resultat_ia, "ia"
-    else:
-        # Fallback regex
-        resultat_regex = parser_sms_regex(body, sender)
-        return resultat_regex, "regex"
-
-# ════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS
-# ════════════════════════════════════════════════════════════════════════════
-
-@app.get("/health")
-def health_check():
-    """Vérification que le serveur est en ligne."""
-    return {
-        "status":    "ok",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "version":   "2.0.0",
-        "ia_active": claude_client is not None
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# ACTIVATION / DISSOCIATION — app Android Tracker
-# ────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/activate")
-def activer_tracker(payload: ActivationRequest):
-    """
-    Associe un téléphone Android à un compte Mobile Money System.
-    Utilise supabase_admin (service_role) pour bypass le RLS de mm_profiles.
-    """
-    code = payload.merchant_code.strip()
-    logger.info(f"🔍 Tentative d'activation — code reçu: '{code}' device: {payload.device_id[:8]}...")
-
-    if len(code) != 8 or not code.isdigit():
-        logger.warning(f"❌ Code invalide: '{code}'")
-        return {"status": "error", "message": "Code invalide — 8 chiffres requis"}
-
-    # Chercher le commerçant — supabase_admin bypass le RLS
-    try:
-        res = supabase_admin.table("mm_profiles") \
-                            .select("id, nom_complet, nom_entreprise, merchant_code") \
-                            .eq("merchant_code", code) \
-                            .execute()
-        logger.info(f"🔍 Lookup mm_profiles: {len(res.data)} résultat(s) pour code '{code}'")
-    except Exception as e:
-        logger.error(f"❌ Erreur lookup mm_profiles: {e}")
-        return {"status": "error", "message": f"Erreur serveur : {str(e)}"}
-
-    if not res.data:
-        # Debug : lister tous les codes existants pour comparaison
-        try:
-            all_codes = supabase_admin.table("mm_profiles") \
-                                       .select("merchant_code") \
-                                       .execute()
-            codes_existants = [r.get("merchant_code") for r in all_codes.data if r.get("merchant_code")]
-            logger.warning(f"⚠ Code '{code}' non trouvé. Codes existants: {codes_existants}")
-        except Exception:
-            logger.warning(f"⚠ Code '{code}' non trouvé. Impossible de lister les codes.")
-        return {"status": "error", "message": "Code incorrect ou inexistant"}
-
-    profil    = res.data[0]
-    user_uuid = profil["id"]
-    user_name_brut = (profil.get("nom_complet")
-                      or profil.get("nom_entreprise")
-                      or "")
-
-    if not user_name_brut:
-        # Fallback : récupérer l'email depuis auth.users via l'admin API
-        try:
-            auth_user = supabase_admin.auth.admin.get_user_by_id(user_uuid)
-            email     = getattr(getattr(auth_user, "user", None), "email", None) or ""
-            # Utiliser la partie avant @ comme nom affiché
-            user_name_brut = email.split("@")[0].replace(".", " ").title() if email else ""
-            logger.info(f"🔍 Fallback email pour nom: '{user_name_brut}'")
-        except Exception as e:
-            logger.warning(f"Impossible de récupérer l'email: {e}")
-            user_name_brut = ""
-
-    user_name = f"Commerçant {user_name_brut}".strip() if user_name_brut else "Commerçant"
-
-    api_token = secrets.token_hex(32)
-
-    # Enregistrer l'appareil — sans association_active (colonne optionnelle)
-    device_data = {
-        "device_id":   payload.device_id,
-        "user_uuid":   user_uuid,
-        "device_name": payload.device_name,
-        "api_token":   api_token,
-        "role":        "CAPTEUR",
-        "is_active":   True,
-        "sim_a_label": payload.sim_a_label,
-        "sim_b_label": payload.sim_b_label,
-        "last_seen_at": datetime.datetime.utcnow().isoformat(),
-    }
-
-    try:
-        supabase_admin.table("tracker_devices") \
-                      .upsert(device_data, on_conflict="device_id") \
-                      .execute()
-        logger.info(f"✅ Appareil enregistré: {payload.device_id[:8]}... user={user_name}")
-    except Exception as e:
-        logger.error(f"❌ Erreur upsert tracker_devices: {e}")
-        # Tentative insert simple en fallback
-        try:
-            supabase_admin.table("tracker_devices").insert(device_data).execute()
-            logger.info(f"✅ Appareil inséré (fallback insert): {payload.device_id[:8]}...")
-        except Exception as e2:
-            logger.error(f"❌ Erreur insert fallback: {e2}")
-            return {"status": "error", "message": f"Impossible d'enregistrer l'appareil : {str(e2)}"}
-
-    return {
-        "status":     "success",
-        "api_token":  api_token,
-        "user_uuid":  user_uuid,
-        "user_name":  user_name,
-        "message":    f"Téléphone associé au compte {user_name}"
-    }
-
-
-@app.post("/api/dissociate")
-def dissocier_tracker(
-    device_id: str,
-    authorization: Optional[str] = Header(None)
-):
-    """
-    Invalide l'association d'un téléphone Android.
-    L'historique des transactions est conservé dans Supabase.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token manquant")
-
-    token = authorization.replace("Bearer ", "").strip()
-
-    # Vérifier que ce token correspond bien à ce device
-    try:
-        res = supabase_admin.table("tracker_devices") \
-                      .select("device_id") \
-                      .eq("device_id", device_id) \
-                      .eq("api_token", token) \
-                      .execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not res.data:
-        raise HTTPException(status_code=403, detail="Token ou device_id invalide")
-
-    # Invalider l'association
-    try:
-        supabase_admin.table("tracker_devices").update({
-            "is_active":          False,
-            "association_active": False,
-            "api_token":          None,
-            "user_uuid":          None,
-        }).eq("device_id", device_id).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    logger.info(f"🔓 Dissociation: device={device_id[:8]}...")
-    return {"status": "success", "message": "Téléphone dissocié avec succès"}
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# RÉCEPTION SMS — depuis l'app Android Tracker
-# ────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/transactions/sms", status_code=201)
-def recevoir_sms(
-    payload: SmsPayload,
-    x_device_id: Optional[str] = Header(None),
-    x_app_key:   Optional[str] = Header(None),
-):
-    """
-    Reçoit un SMS depuis l'app Android Tracker.
-
-    Logique intelligente :
-    - L'app envoie TOUJOURS ses SMS, sans vérifier l'association
-    - Le serveur vérifie si ce device_id est enregistré dans tracker_devices
-    - Device connu + actif → traite la transaction pour ce commerçant
-    - Device inconnu → ignore silencieusement (202), pas d'erreur
-
-    Cette approche permet à l'app de capturer immédiatement sans configuration,
-    et d'envoyer au serveur dès le premier lancement.
-    """
-
-    # Vérification clé d'application minimale (anti-spam)
-    APP_KEY = os.environ.get("TRACKER_APP_KEY", "GRAHAM_TRACKER_2025")
-    if x_app_key and x_app_key != APP_KEY:
-        raise HTTPException(status_code=401, detail="Clé application invalide")
-
-    device_id = x_device_id or payload.device_id
-    if not device_id:
-        raise HTTPException(status_code=400, detail="device_id manquant")
-
-    # ── Vérifier si ce device est enregistré et associé ───────────
-    try:
-        res = supabase_admin.table("tracker_devices") \
-                            .select("user_uuid, is_active, sim_a_label, sim_b_label") \
-                            .eq("device_id", device_id) \
-                            .execute()
-    except Exception as e:
-        logger.error(f"Erreur lookup tracker_devices: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not res.data:
-        # Device inconnu — ignorer silencieusement
-        logger.info(f"📵 Device inconnu {device_id[:8]}... — SMS ignoré (pas encore associé)")
-        return JSONResponse(status_code=202, content={
-            "status":  "ignored",
-            "reason":  "device_not_registered",
-            "message": "Device non enregistré — associez d'abord via Mobile Money System"
-        })
-
-    device    = res.data[0]
-    user_uuid = device.get("user_uuid")
-
-    if not device.get("is_active", False) or not user_uuid:
-        logger.info(f"📵 Device {device_id[:8]}... inactif ou non associé — ignoré")
-        return JSONResponse(status_code=202, content={
-            "status":  "ignored",
-            "reason":  "device_inactive",
-            "message": "Device inactif ou non associé à un compte"
-        })
-
-    # ── Mettre à jour last_seen_at ─────────────────────────────────
-    try:
-        supabase_admin.table("tracker_devices") \
-                      .update({"last_seen_at": datetime.datetime.utcnow().isoformat()}) \
-                      .eq("device_id", device_id).execute()
-    except Exception:
-        pass
-
-    # ── Déduplication robuste ─────────────────────────────────────
-    # ── Déduplication : hash = device_id + timestamp + corps complet ──
-    # Le timestamp garantit l'unicité même si deux SMS ont le même contenu
-    # (ex: deux transferts NOWORRI du même montant à des heures différentes)
-    import hashlib
-    sms_hash = hashlib.md5(
-        f"{device_id}|{payload.timestamp}|{payload.body}".encode()
-    ).hexdigest()
-
-    try:
-        existing = supabase.table("transactions") \
-                           .select("id") \
-                           .eq("device_id", device_id) \
-                           .eq("sms_hash",  sms_hash) \
-                           .execute()
-        if existing.data:
-            # Vrai doublon : même appareil, même timestamp, même corps → retry app
-            logger.info(f"Vrai doublon ignoré (device+timestamp+body identiques)")
-            return {"status": "duplicate", "id": existing.data[0]["id"]}
-    except Exception:
-        pass  # Colonne absente → continuer sans déduplication
-
-    # ── Parsing IA + fallback regex ───────────────────────────────
-    parsed, source = parser_sms(payload.body, payload.sender)
-
-    confiance = float(parsed.get("confiance", 0.85))
-    raison    = parsed.get("raison",           "momo_depot")
-    amount    = int(parsed.get("amount",       payload.amount or 0))
-    phone     = parsed.get("phone",            payload.phone  or "")
-    nom_dest  = parsed.get("nom_destinataire", "")
-    reference = parsed.get("reference_id",     payload.transaction_id or "")
-    solde     = int(parsed.get("solde",        0))
-    frais     = int(parsed.get("frais",        0))
-
-    statut = "pending" if (source == "ia" and confiance < SEUIL_CONFIANCE_IA) \
-             else "confirmed"
-
-    operateur  = payload.operator or _detecter_operateur(payload.sender, payload.body)
-    account_map = {"MTN": 1, "MOOV": 2, "CELTIS": 3, "CELTIIS": 3}
-    account_id  = account_map.get(operateur.upper(), 1)
-
-    # ── Extraction nom et téléphone AVANT l'insert ───────────────
-    body_tx = payload.body
-
-    # Format TERRAPAY/international : "Ref:+33775958076,FR,Billy KEKE,5000"
-    if not nom_dest or not phone:
-        m_ref = re.search(r'Ref:\s*(\+?[0-9]+),([A-Z]{2}),([^,\n]+),',
-                          body_tx, re.IGNORECASE)
-        if m_ref:
-            if not phone:    phone    = m_ref.group(1).strip()
-            if not nom_dest: nom_dest = m_ref.group(3).strip()
-
-    if not nom_dest:
-        # Format retrait : "5000F recu de NOM ,TEL, le DATE"
-        m1 = re.search(r'recu\s+de\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)\s*,',
-                       body_tx, re.IGNORECASE)
-        if m1: nom_dest = m1.group(1).strip()
-
-    if not nom_dest:
-        # Format dépôt : "depot XXXF a NOM le DATE" ou "depot XXXF a NOM ,TEL, le DATE"
-        m2 = re.search(r'\ba\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ\s\-\.]{0,40}?)(?:\s*,|\s+le\s+\d)',
-                       body_tx, re.IGNORECASE)
-        if m2: nom_dest = m2.group(1).strip()
-
-    if not nom_dest:
-        # Format MFS marchand : "de MFS NOM SP 2026"
-        m3 = re.search(r'\bde\s+MFS\s+([A-Z][A-Z0-9\s\-&\.]{2,40}?)(?:\s+\d{4}|\s+Ref|,|$)',
-                       body_tx, re.IGNORECASE)
-        if m3: nom_dest = m3.group(1).strip()
-
-    if not phone:
-        m_t1 = re.search(r',\s*(\+?[0-9]{8,13})\s*,', body_tx)
-        if m_t1: phone = m_t1.group(1).strip()
-        else:
-            m_t2 = re.search(r'\b((?:00229|229)[679]\d{7})\b', body_tx)
-            if m_t2: phone = m_t2.group(1)
-            else:
-                m_t3 = re.search(r'\b([679]\d{7})\b', body_tx)
-                if m_t3: phone = m_t3.group(1)
-
-    logger.info(f"📋 {operateur} {amount}F {raison} | "
-                f"nom='{nom_dest or '—'}' phone='{phone or '—'}' | {statut}")
-
-    # ── Récupérer le solde précédent AVANT l'insert (pour calcul delta) ──
-    solde_precedent = 0
-    if solde > 0:
-        try:
-            res_prev = supabase.table("transactions") \
-                               .select("solde") \
-                               .eq("account_id", account_id) \
-                               .not_.is_("solde", "null") \
-                               .gt("solde", 0) \
-                               .order("created_at", desc=True) \
-                               .limit(1).execute()
-            if res_prev.data:
-                solde_precedent = int(res_prev.data[0].get("solde") or 0)
-                logger.info(f"📊 Solde précédent: {solde_precedent}F → Solde actuel: {solde}F → Delta: {solde - solde_precedent:+}F")
-        except Exception as e:
-            logger.warning(f"Impossible de lire le solde précédent: {e}")
-
-    # ── Insertion en base ─────────────────────────────────────────
-    insert_data = {
-        "account_id":       account_id,
-        "raison":           raison,
-        "amount":           amount,
-        "phone_number":     phone or None,
-        "nom_destinataire": nom_dest or None,
-        "reference_id":     reference or None,
-        "solde":            solde if solde > 0 else None,
-        "frais":            frais,
-        "statut":           statut,
-        "raw_message":      payload.body,
-        "sender":           payload.sender,
-        "sms_hash":         sms_hash,
-    }
-
-    optional_fields = {
-        "confiance_ia":   confiance,
-        "source_parsing": source,
-        "device_id":      device_id,
-        "user_uuid":      user_uuid,
-        "sim_label":      payload.sim_label or None,
-        "sim_slot":       payload.sim_slot if payload.sim_slot != -1 else None,
-        "direction":      payload.direction or "IN",
-        "sms_timestamp":  payload.timestamp or None,
-    }
-
-    try:
-        res_ins = supabase.table("transactions").insert(
-            {**insert_data, **optional_fields}
-        ).execute()
-    except Exception as e:
-        logger.warning(f"Insert complet échoué ({e}) — tentative minimale")
-        try:
-            res_ins = supabase.table("transactions").insert(insert_data).execute()
-        except Exception as e2:
-            logger.error(f"Erreur insertion: {e2}")
-            raise HTTPException(status_code=500, detail=str(e2))
-
-    tx_id_str = str(res_ins.data[0]["id"]) if res_ins.data else ""
-    logger.info(f"✅ Transaction id={tx_id_str} | {operateur} {amount}F {raison}")
-
-    # ── Mise à jour cash physique ─────────────────────────────────
-    if amount > 0 and statut == "confirmed":
-        try:
-            maj_current_cash(
-                account_id      = account_id,
-                amount          = amount,
-                raison          = raison,
-                solde_nouveau   = solde,
-                solde_ancien    = solde_precedent,
-                transaction_id  = tx_id_str
-            )
-        except Exception as e_cash:
-            logger.error(f"Erreur maj cash: {e_cash}")
-
-    return {
-        "status":   "success",
-        "id":       tx_id_str,
-        "statut":   statut,
-        "raison":   raison,
-        "amount":   amount,
-        "source":   source,
-        "message":  "Transaction enregistrée"
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# CONFIRMATION MANUELLE — depuis Graham POS (transactions pending)
-# ────────────────────────────────────────────────────────────────────────────
-
-@app.post("/transactions/{transaction_id}/confirmer")
-def confirmer_transaction(
-    transaction_id: int,
-    payload: ConfirmationRequest
-):
-    """
-    Confirme manuellement une transaction en statut 'pending'.
-    Appelé depuis Graham POS quand le caissier choisit le bon type.
-
-    Cette fonction existait dans la version précédente — conservée et
-    étendue pour mettre à jour aussi sim_label si disponible.
-    """
-    raisons_valides = {
-        "momo_depot", "momo_retrait", "momo_transfert",
-        "momo_paiement", "momo_envoi", "ignored"
-    }
-    if payload.raison not in raisons_valides:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Raison invalide. Valeurs acceptées : {raisons_valides}"
-        )
-
-    nouveau_statut = "confirmed" if payload.raison != "ignored" else "ignored"
-
-    try:
-        res = supabase.table("transactions").update({
-            "raison":  payload.raison,
-            "statut":  nouveau_statut,
-        }).eq("id", transaction_id).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Transaction introuvable")
-
-    logger.info(f"✅ Transaction #{transaction_id} confirmée: {payload.raison}")
-    return {
-        "status":  "ok",
-        "id":      transaction_id,
-        "raison":  payload.raison,
-        "statut":  nouveau_statut,
-        "message": "Transaction confirmée"
-    }
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# LISTE DES TRANSACTIONS PENDING — pour Graham POS
-# ────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/debug/cash/{account_id}")
-def debug_cash(account_id: int):
-    """
-    Diagnostic rapide de l'état du cash pour un compte.
-    Appeler depuis le navigateur pour vérifier sans envoyer de SMS.
-    """
-    try:
-        res = supabase_admin.table("cash_sessions").select("*") \
-                      .eq("account_id", account_id) \
-                      .eq("actif", True) \
-                      .gt("opening_cash", 0) \
-                      .order("created_at", desc=True) \
-                      .limit(1).execute()
-        session = res.data[0] if res.data else None
-    except Exception as e:
-        session = None
-
-    try:
-        mvs = supabase.table("cash_movements").select("*") \
-                      .eq("account_id", account_id) \
-                      .order("created_at", desc=True) \
-                      .limit(5).execute()
-        mouvements = mvs.data or []
-    except Exception:
-        mouvements = []
-
-    return {
-        "account_id":     account_id,
-        "session_active": session is not None,
-        "session":        session,
-        "derniers_mouvements": mouvements,
-        "message": "Session active ✅" if session else
-                   "❌ Aucune session active — saisir cash départ dans Mobile Money System"
-    }
-
-
-@app.get("/api/test/cash")
-def test_maj_cash(account_id: int = 1, amount: int = 1000, type_op: str = "DEPOT"):
-    """
-    Test direct de transaction_engine — accessible depuis le navigateur.
-    Exemple: https://graham-sms-server.onrender.com/api/test/cash?account_id=1&amount=5000&type_op=DEPOT
-    """
-    ok = transaction_engine(
-        account_id     = account_id,
-        amount         = amount,
-        type_operation = type_op,
-        transaction_id = "TEST_MANUEL"
-    )
-    return {
-        "status":     "✅ succès" if ok else "❌ échec",
-        "type_op":    type_op,
-        "amount":     amount,
-        "account_id": account_id,
-        "message":    "Vérifier les logs Render et la table cash_sessions dans Supabase",
-    }
-
-
-@app.get("/api/debug/code/{code}")
-def debug_code(code: str):
-    """
-    Endpoint de diagnostic — vérifie si un code existe dans mm_profiles.
-    À utiliser depuis le navigateur pour diagnostiquer les problèmes d'association.
-    Exemple : https://graham-sms-server.onrender.com/api/debug/code/12345678
-    """
-    try:
-        res = supabase_admin.table("mm_profiles") \
-                            .select("id, nom_complet, nom_entreprise, merchant_code") \
-                            .eq("merchant_code", code.strip()) \
-                            .execute()
-
-        # Compter le total des profils
-        total = supabase_admin.table("mm_profiles").select("id, merchant_code").execute()
-        nb_total = len(total.data) if total.data else 0
-        codes_existants = [
-            r.get("merchant_code", "NULL")
-            for r in (total.data or [])
-        ]
-
-        return {
-            "code_recherché":   code.strip(),
-            "trouvé":          len(res.data) > 0,
-            "résultat":        res.data,
-            "total_profils":   nb_total,
-            "codes_existants": codes_existants,
-            "supabase_admin_ok": True
-        }
-    except Exception as e:
-        return {
-            "code_recherché":    code.strip(),
-            "trouvé":           False,
-            "erreur":           str(e),
-            "supabase_admin_ok": False
-        }
-
-
-
-@app.get("/api/pending")
-def lister_pending(account_id: int = 0):
-    """
-    Retourne les transactions en attente de confirmation manuelle.
-    Utilisé par Graham POS pour afficher le badge rouge et les alertes.
-    """
-    try:
-        query = supabase.table("transactions") \
-                        .select("*") \
-                        .eq("statut", "pending") \
-                        .order("created_at", desc=True)
-        if account_id > 0:
-            query = query.eq("account_id", account_id)
-        res = query.execute()
-        return {"pending": res.data or [], "count": len(res.data or [])}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# UTILITAIRES INTERNES
-# ════════════════════════════════════════════════════════════════════════════
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TRANSACTION ENGINE — SEULE FONCTION AUTORISÉE À MODIFIER LE CASH
-# ════════════════════════════════════════════════════════════════════════════
-
-def transaction_engine(account_id: int, amount: int, type_operation: str,
-                       transaction_id: str = "", solde_sim_apres: int = 0) -> bool:
-    """
-    SEULE fonction qui modifie current_cash, current_virtuel et cash_movements.
-
-    DEPOT  : client donne cash → agent crédite SIM
-        cash physique  AUGMENTE  (+amount)
-        cash virtuel   DIMINUE   (-amount)
-
-    RETRAIT : client prend cash ← agent débite SIM
-        cash physique  DIMINUE   (-amount)
-        cash virtuel   AUGMENTE  (+amount)
-
-    Retourne True si succès, False sinon.
-    """
-    if amount <= 0:
-        logger.info(f"⏭ transaction_engine: amount={amount} → ignoré")
-        return False
-
-    if type_operation == "DEPOT":
-        delta_cash    = +amount   # physique AUGMENTE
-        delta_virtuel = -amount   # virtuel  DIMINUE
-    elif type_operation == "RETRAIT":
-        delta_cash    = -amount   # physique DIMINUE
-        delta_virtuel = +amount   # virtuel  AUGMENTE
-    else:
-        logger.error(f"⛔ transaction_engine: type_operation='{type_operation}' invalide")
-        return False
-
-    # ── Lire la session active ─────────────────────────────────────
-    try:
-        res = supabase_admin.table("cash_sessions").select(
-            "id,current_cash,opening_cash,current_virtuel,opening_virtuel"
-        ).eq("account_id", account_id).eq("actif", True).gt("opening_cash", 0) \
-         .order("created_at", desc=True).limit(1).execute()
-
-        if not res.data:
-            logger.warning(f"⏭ transaction_engine: aucune session active (account_id={account_id})")
-            return False
-    except Exception as e:
-        logger.error(f"⛔ transaction_engine: erreur lecture session: {e}")
-        return False
-
-    sess      = res.data[0]
-    sess_id   = sess["id"]
-
-    # Valeurs actuelles
-    cash_av   = int(float(sess.get("current_cash")    or sess.get("opening_cash")    or 0))
-    virt_av   = int(float(sess.get("current_virtuel") or sess.get("opening_virtuel") or 0))
-
-    # Nouvelles valeurs
-    cash_ap   = max(0, cash_av + delta_cash)
-    virt_ap   = int(solde_sim_apres) if solde_sim_apres > 0 else max(0, virt_av + delta_virtuel)
-
-    logger.info(
-        f"💵 {type_operation} {amount}F | "
-        f"Cash: {cash_av}→{cash_ap}F ({delta_cash:+}) | "
-        f"Virtuel: {virt_av}→{virt_ap}F ({delta_virtuel:+})"
-    )
-
-    # ── Mettre à jour la session ───────────────────────────────────
-    try:
-        upd = supabase_admin.table("cash_sessions").update({
-            "current_cash":    cash_ap,
-            "current_virtuel": virt_ap,
-        }).eq("id", sess_id).execute()
-
-        nb = len(upd.data) if upd.data else 0
-        if nb == 0:
-            logger.error(f"⛔ transaction_engine: UPDATE 0 lignes (session_id={sess_id})")
-            return False
-        logger.info(f"✅ Session {sess_id} mise à jour")
-    except Exception as e:
-        logger.error(f"⛔ transaction_engine: erreur UPDATE session: {e}")
-        return False
-
-    # ── Enregistrer le mouvement (journal immuable) ───────────────
-    mv = {
-        "account_id":       account_id,
-        "amount":           delta_cash,
-        "type":             type_operation,
-        "cash_apres":       cash_ap,
-        "type_operation":   type_operation,
-        "ancien_physique":  cash_av,
-        "nouveau_physique": cash_ap,
-        "ancien_virtuel":   virt_av,
-        "nouveau_virtuel":  virt_ap,
-    }
-    if transaction_id:
-        mv["transaction_id"] = transaction_id
-    try:
-        supabase_admin.table("cash_movements").insert(mv).execute()
-    except Exception:
-        try:
-            supabase_admin.table("cash_movements").insert({
-                "account_id": account_id, "amount": delta_cash,
-                "type": type_operation,   "cash_apres": cash_ap,
-                "transaction_id": transaction_id or None
-            }).execute()
-        except Exception as e2:
-            logger.error(f"Erreur écriture cash_movements: {e2}")
-            # Ne pas retourner False — la session est déjà mise à jour
-
-    return True
-
-
 def maj_current_cash(account_id: int, amount: int, raison: str,
-                     solde_nouveau: int = 0, solde_ancien: int = 0,
-                     transaction_id: str = "") -> bool:
-    """
-    Détermine DEPOT ou RETRAIT et délègue à transaction_engine().
-    C'est la SEULE façon d'appeler transaction_engine depuis l'extérieur.
-    """
-    if amount <= 0:
-        return False
+                     solde_avant: int, solde_apres: int):
+    from datetime import datetime, timezone, timedelta
+    paris     = timezone(timedelta(hours=2))
+    utc       = timezone.utc
+    now_paris = datetime.now(paris)
+    # Début du jour heure Paris → converti en UTC pour Supabase
+    debut_paris = now_paris.replace(hour=0, minute=0, second=0, microsecond=0)
+    debut_utc   = debut_paris.astimezone(utc)
+    debut_str   = debut_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
-    if not reseau_est_actif(account_id):
-        logger.info(f"⏭ Réseau {account_id} OFF → cash non mis à jour")
-        return False
-
-    # Déterminer le type via delta SIM (prioritaire) ou raison (fallback)
-    if solde_nouveau > 0 and solde_ancien > 0:
-        delta_sim = solde_nouveau - solde_ancien
-        if delta_sim < 0:
-            type_op = "DEPOT"    # SIM ↓ : agent a crédité → reçu cash
-            logger.info(f"🔍 Delta SIM {solde_ancien}→{solde_nouveau} ({delta_sim}) → DEPOT")
-        elif delta_sim > 0:
-            type_op = "RETRAIT"  # SIM ↑ : agent a reçu mobile → donné cash
-            logger.info(f"🔍 Delta SIM {solde_ancien}→{solde_nouveau} (+{delta_sim}) → RETRAIT")
-        else:
-            # Même solde → fallback raison
-            if raison == "momo_depot":
-                type_op = "DEPOT"
-            elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-                type_op = "RETRAIT"
-            else:
-                return False
-            logger.info(f"🔍 Delta SIM=0 → fallback raison={raison} → {type_op}")
+    if solde_avant is not None and solde_apres is not None and solde_avant > 0:
+        diff_sim = solde_apres - solde_avant
+        delta    = amount if diff_sim < 0 else -amount
     else:
-        # Pas de solde → raison directement
         if raison == "momo_depot":
-            type_op = "DEPOT"
-        elif raison in ("momo_retrait","momo_transfert","momo_paiement","momo_envoi"):
-            type_op = "RETRAIT"
+            delta = +amount
+        elif raison in ("momo_retrait","momo_transfert",
+                        "momo_paiement","momo_envoi"):
+            delta = -amount
         else:
-            logger.info(f"⏭ raison={raison} sans solde → ignoré")
-            return False
-        logger.info(f"🔍 Fallback raison={raison} → {type_op}")
+            print(f"⏭️  raison={raison} sans solde — ignoré")
+            return
 
-    return transaction_engine(
-        account_id     = account_id,
-        amount         = amount,
-        type_operation = type_op,
-        transaction_id = transaction_id,
-        solde_sim_apres= solde_nouveau
-    )
+    try:
+        res = supabase.table("cash_sessions").select("*")\
+                      .eq("account_id", account_id)\
+                      .gte("created_at", debut_str)\
+                      .gt("opening_cash", 0)\
+                      .order("created_at", desc=False)\
+                      .limit(1).execute()
 
-def _detecter_operateur(sender: str, body: str) -> str:
-    """Détecte l'opérateur Mobile Money depuis l'expéditeur et le corps du SMS."""
-    combined = f"{sender} {body}".upper()
-    if "MTN" in combined or "MOMO" in combined:
-        return "MTN"
-    elif "MOOV" in combined or "FLOOZ" in combined:
-        return "MOOV"
-    elif "CELTIIS" in combined or "CELTIS" in combined:
-        return "CELTIS"
-    return "MTN"  # défaut
+        if res.data:
+            sess    = res.data[0]
+            opening = float(sess.get("opening_cash") or 0)
+            if opening <= 0:
+                print(f"⏭️  Solde départ non saisi — ignoré")
+                return
+            _cc = sess.get("current_cash")
+            current = float(_cc) if _cc is not None else opening
+            # Si cash épuisé (= 0) → pause totale, ignorer la transaction
+            if current == 0:
+                print(f"⏭️  Cash épuisé (0 F) — transaction ignorée")
+                return
+            nouveau = max(0, current + delta)
+            supabase.table("cash_sessions")\
+                    .update({"current_cash": nouveau})\
+                    .eq("id", sess["id"]).execute()
+            sens = f"↑ +{abs(delta)}" if delta > 0 else f"↓ -{abs(delta)}"
+            print(f"💵 {sens} F | {current} → {nouveau} F "
+                  f"| SIM {solde_avant}→{solde_apres}")
+        else:
+            print(f"⚠️  Aucune session cash du jour (account_id={account_id})")
+            print(f"   debut_utc={debut_str} — caissier doit saisir le départ")
+    except Exception as e:
+        print(f"⚠️  Erreur maj_current_cash : {e}")
 
+@app.get("/")
+def home():
+    return {"message": "✅ Graham POS SMS Server v3 — opérationnel"}
 
-# ════════════════════════════════════════════════════════════════════════════
-# DÉMARRAGE
-# ════════════════════════════════════════════════════════════════════════════
+@app.post("/sms")
+async def recevoir_sms(request: Request):
+    try:
+        body = await request.json()
+    except:
+        try:
+            form = await request.form()
+            body = dict(form)
+        except:
+            body = {}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    print("📩 Body :", body)
+
+    message = (body.get("message") or body.get("text") or
+               body.get("body") or body.get("sms") or
+               body.get("key") or "").strip()
+    sender = (body.get("sender") or body.get("from") or
+              body.get("number") or "").strip()
+
+    if not message and "key" in body:
+        key_val = str(body["key"])
+        lignes = key_val.split("\n", 1)
+        if len(lignes) == 2:
+            m_num = re.search(r'[\+\d]{8,15}', lignes[0])
+            if m_num and not sender:
+                sender = m_num.group(0)
+            message = lignes[1].strip()
+        else:
+            message = key_val.strip()
+
+    print(f"📱 Sender  : {sender}")
+    print(f"💬 Message : {message[:80]}")
+
+    if not est_financier(message):
+        print("⏭️  SMS non financier — ignoré")
+        return {"status": "ignored", "reason": "non_financier"}
+
+    parsed = parser_sms(message, sender)
+    print("✅ Parsed  :", parsed)
+
+    if parsed["raison"] == "test_non_resolu":
+        print("⚠️  Template non résolu — ignoré")
+        return {"status": "ignored"}
+
+    try:
+        # Récupérer le dernier solde SIM avant cette transaction
+        try:
+            res_prev = supabase.table("transactions")\
+                               .select("solde")\
+                               .eq("account_id", parsed["account_id"])\
+                               .not_.is_("solde", "null")\
+                               .order("created_at", desc=True)\
+                               .limit(1).execute()
+            solde_avant = int(res_prev.data[0]["solde"]) \
+                          if res_prev.data else None
+        except: solde_avant = None
+
+        payload = {k: v for k, v in parsed.items() if v is not None}
+        res     = supabase.table("transactions").insert(payload).execute()
+        id_ins  = res.data[0].get("id","?") if res.data else "?"
+        solde_apres = parsed.get("solde")
+        print(f"✅ transactions ID:{id_ins} | {parsed.get('raison')} | "
+              f"{parsed.get('amount')} F | SIM:{solde_avant}→{solde_apres}")
+
+        if parsed.get("amount") and parsed.get("account_id"):
+            maj_current_cash(
+                parsed["account_id"],
+                parsed["amount"],
+                parsed["raison"],
+                solde_avant,
+                solde_apres)
+
+        return {"status": "ok", "id": id_ins}
+
+    except Exception as e1:
+        print(f"❌ Erreur : {e1}")
+        try:
+            p_min = {
+                "raw_message": parsed.get("raw_message", ""),
+                "sender": parsed.get("sender", "MTN"),
+                "account_id": parsed.get("account_id"),
+                "raison": parsed.get("raison", "inconnu"),
+            }
+            if parsed.get("amount"): p_min["amount"] = parsed["amount"]
+            if parsed.get("phone_number"): p_min["phone_number"] = parsed["phone_number"]
+            if parsed.get("reference_id"): p_min["reference_id"] = parsed["reference_id"]
+            res2 = supabase.table("transactions").insert(p_min).execute()
+            id2 = res2.data[0].get("id", "?") if res2.data else "?"
+            print(f"✅ minimal ID:{id2}")
+            if parsed.get("amount") and parsed.get("account_id"):
+                maj_current_cash(parsed["account_id"], parsed["amount"],
+                                 parsed["raison"], solde_avant,
+                                 parsed.get("solde"))
+            return {"status": "ok_minimal", "id": id2}
+        except Exception as e2:
+            print(f"❌ Erreur finale : {e2}")
+            return {"status": "error", "detail": str(e2)}
+
+@app.post("/sms/test")
+def test_sms(sms: SMS):
+    msg = sms.message or \
+          "Transfert 5000F a KEKE BILLY(22961000000) 2026-05-06 10:07:36 " \
+          "Frais:0F Solde:47088F ID:12002009086"
+    parsed = parser_sms(msg, sms.sender or "MTN")
+    payload = {k: v for k, v in parsed.items() if v is not None}
+    res = supabase.table("transactions").insert(payload).execute()
+    id_t = res.data[0].get("id", "?") if res.data else "?"
+    if parsed.get("amount") and parsed.get("account_id"):
+        maj_current_cash(parsed["account_id"], parsed["amount"],
+                         parsed["raison"], None, parsed.get("solde"))
+    print(f"✅ TEST ID:{id_t}")
+    return {"status": "test_ok", "id": id_t, "parsed": parsed}
