@@ -674,6 +674,22 @@ def recevoir_sms(
     except Exception:
         pass
 
+    # ── FIX filtrage SMS non-financiers (ex: messages d'amis) ───────
+    # Placé AVANT la déduplication et le parsing IA/regex : un SMS
+    # personnel ne doit ni consommer un appel Claude, ni créer de
+    # transaction, ni polluer l'historique. Voir est_sms_financier() plus
+    # bas dans ce fichier pour le détail de la logique et son ajustement.
+    if not est_sms_financier(payload.sender, payload.body):
+        logger.info(
+            f"🚫 SMS non-financier ignoré | sender='{payload.sender}' | "
+            f"device={device_id[:8]}..."
+        )
+        return JSONResponse(status_code=202, content={
+            "status":  "ignored",
+            "reason":  "non_financier",
+            "message": "SMS ne ressemble pas à une transaction Mobile Money — ignoré"
+        })
+
     # ── Déduplication robuste ─────────────────────────────────────
     # ── Déduplication : hash = device_id + timestamp + corps complet ──
     # Le timestamp garantit l'unicité même si deux SMS ont le même contenu
@@ -828,6 +844,40 @@ def recevoir_sms(
 
     tx_id_str = str(res_ins.data[0]["id"]) if res_ins.data else ""
     logger.info(f"✅ Transaction id={tx_id_str} | {operateur} {amount}F {raison}")
+
+    # ── FIX "solde SIM par SIM" immunisé contre les suppressions ──────
+    # Le champ `solde` d'un SMS est une vérité rapportée directement par
+    # le réseau — indépendante de la classification (dépôt/retrait/en
+    # attente). On la persiste donc ICI, dès réception, dans une table à
+    # part (sim_soldes), qu'aucune suppression de transaction plus tard
+    # ne pourra jamais affecter — contrairement à un recalcul depuis
+    # `transactions` qui, lui, retombe sur une valeur plus ancienne dès
+    # que la ligne la plus récente est supprimée.
+    if solde > 0 and payload.sim_label:
+        try:
+            # Normalisation : payload.sim_label peut arriver avec un
+            # suffixe variable (ex: "SIM A - Orange") — on ne garde que
+            # "SIM A"/"SIM B" pour matcher exactement ce que page_sim()
+            # recherche côté desktop (même normalisation qu'ailleurs dans
+            # ce fichier/le desktop pour l'affichage).
+            _sim_raw = str(payload.sim_label).strip().upper()
+            if _sim_raw.startswith("SIM A"):
+                _sim_norm = "SIM A"
+            elif _sim_raw.startswith("SIM B"):
+                _sim_norm = "SIM B"
+            else:
+                _sim_norm = None
+
+            if _sim_norm:
+                supabase_admin.table("sim_soldes").upsert({
+                    "user_uuid":  user_uuid,
+                    "account_id": account_id,
+                    "sim_label":  _sim_norm,
+                    "solde":      solde,
+                    "updated_at": datetime.datetime.utcnow().isoformat(),
+                }, on_conflict="user_uuid,account_id,sim_label").execute()
+        except Exception as e_sim_solde:
+            logger.error(f"Erreur upsert sim_soldes: {e_sim_solde}")
 
     # ── Mise à jour cash physique ─────────────────────────────────
     if amount > 0 and statut == "confirmed":
@@ -1419,6 +1469,85 @@ def maj_current_cash(account_id: int, amount: int, raison: str,
         solde_sim_apres= solde_nouveau,
         user_uuid      = user_uuid,
     )
+
+def est_sms_financier(sender: str, body: str) -> bool:
+    """
+    ── FIX filtrage SMS non-financiers ──────────────────────────────────────
+    L'app Android transmet aujourd'hui TOUS les SMS reçus, y compris les
+    messages personnels (un ami qui écrit "j'ai reçu ton virement, merci !")
+    dès lors que l'app tourne sur le téléphone. Cette fonction sert de
+    dernier filet de sécurité côté serveur, APPELÉE AVANT le parsing IA/regex
+    (donc avant même de consommer un appel Claude), pour rejeter les SMS qui
+    ne ressemblent clairement pas à un SMS transactionnel officiel d'un
+    opérateur Mobile Money.
+
+    Le filtre principal et le plus fiable reste néanmoins à faire côté app
+    Android elle-même (au niveau du BroadcastReceiver qui intercepte les
+    SMS) — c'est là qu'un SMS personnel peut être écarté AVANT même de
+    quitter le téléphone, ce qui est important pour la vie privée de la
+    personne qui a envoyé ce message (elle n'a jamais consenti à ce que son
+    SMS parte vers un serveur professionnel). Ce filtre serveur n'est qu'un
+    second filet, pas le premier rempart.
+
+    Logique (OR) :
+      1. L'expéditeur correspond à un identifiant opérateur connu (nom
+         court, pas un numéro de téléphone personnel) → SMS accepté.
+      2. L'expéditeur ressemble à un "short code" opérateur (peu de
+         chiffres, pas un numéro de téléphone complet) → accepté.
+      3. Le corps contient au moins un mot-clé financier ET l'expéditeur
+         NE ressemble PAS à un numéro de téléphone personnel classique
+         → accepté (filet de sécurité pour un identifiant d'opérateur
+         non listé ci-dessous).
+      Sinon → rejeté (SMS personnel probable).
+
+    ⚠️ À AJUSTER : la liste EXPEDITEURS_CONNUS doit être complétée avec les
+    vrais identifiants d'expéditeur utilisés par MTN/Moov/Celtis au Bénin
+    (visibles directement dans les SMS reçus sur le téléphone — regarde le
+    nom affiché comme expéditeur, pas le contenu).
+    """
+    EXPEDITEURS_CONNUS = [
+        "MTN", "MTNMONEY", "MTN MONEY", "MOMO", "MMONEY", "M-MONEY",
+        "MOOV", "MOOVMONEY", "MOOV MONEY", "FLOOZ",
+        "CELTIIS", "CELTIS", "CELTIISCASH", "CELTIIS CASH",
+        "TERRAPAY", "NOWORRI",
+    ]
+    MOTS_CLES_FINANCIERS = [
+        "fcfa", "xof", "solde", "reçu", "recu", "retrait", "dépot", "depot",
+        "dépôt", "transfert", "crédité", "credite", "débité", "debite",
+        "paiement", "montant frais", "compte momo", "mobile money",
+        "withdraw", "deposit", "balance", "ref:", "id:", "transaction id",
+    ]
+
+    sender_up = (sender or "").strip().upper()
+    body_low  = (body or "").strip().lower()
+
+    if not sender_up and not body_low:
+        return False
+
+    # 1) Expéditeur reconnu comme identifiant opérateur
+    if any(exp in sender_up for exp in EXPEDITEURS_CONNUS):
+        return True
+
+    # Un numéro de téléphone personnel classique : que des chiffres/espaces/
+    # +/- , entre 8 et 15 caractères (ex: "+22997123456", "97123456").
+    expediteur_est_numero_perso = bool(
+        re.fullmatch(r"[+]?[0-9][0-9\s\-]{6,14}", sender_up)
+    )
+
+    # 2) Short code opérateur : peu de chiffres (typiquement 3 à 6),
+    # clairement différent d'un numéro de téléphone complet.
+    if re.fullmatch(r"[0-9]{3,6}", sender_up) and not expediteur_est_numero_perso:
+        return True
+
+    # 3) Contenu financier depuis un expéditeur qui n'est pas un numéro
+    # de téléphone personnel classique (garde-fou pour un identifiant
+    # d'opérateur non encore listé ci-dessus).
+    contenu_financier = any(mc in body_low for mc in MOTS_CLES_FINANCIERS)
+    if contenu_financier and not expediteur_est_numero_perso:
+        return True
+
+    return False
+
 
 def _detecter_operateur(sender: str, body: str) -> str:
     """Détecte l'opérateur Mobile Money depuis l'expéditeur et le corps du SMS."""
